@@ -1,5 +1,7 @@
 # B2B Lead Enrichment & Scoring Agent
 
+[![CI Pipeline](https://github.com/Nazar-Plokhuta/lead-enrichment-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/Nazar-Plokhuta/lead-enrichment-agent/actions/workflows/ci.yml) ![Python Version](https://img.shields.io/badge/python-3.11%2B-blue.svg) ![License: MIT](https://img.shields.io/badge/license-MIT-green.svg) ![Code Style: Ruff](https://img.shields.io/badge/code%20style-ruff-000000.svg)
+
 A high-performance, fully asynchronous pipeline that crawls target company domains, extracts semantic Markdown, and computes deterministic ICP fit scores using LLM Structured Outputs.  Results are persisted to SQLite with full audit trails, idempotency guarantees, and bounded concurrency.
 
 ---
