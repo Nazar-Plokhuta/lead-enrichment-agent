@@ -1,0 +1,26 @@
+# Python environment & cache
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+env/
+venv/
+
+# Environment secrets
+.env
+.env.local
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Playwright artifacts
+test-results/
+playwright-report/
+
+# Cursor & IDE local state
+.cursor/
+.idea/
+.vscode/
+docs/internal/
