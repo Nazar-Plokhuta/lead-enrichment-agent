@@ -36,7 +36,21 @@ class ScrapeError(LeadEnrichmentError):
 
 
 class LLMExtractionError(LeadEnrichmentError):
-    """Raised when the LLM client cannot produce a validated structured output."""
+    """Raised when the LLM client cannot produce a validated structured output.
+
+    Mirrors the structure of ``ScrapeError`` so that the orchestration layer
+    can handle both failure modes uniformly (log url + reason, mark lead FAILED).
+
+    Attributes:
+        url:    The company URL that was being enriched when the error occurred.
+        reason: Human-readable description of the failure mode (API error,
+                schema validation failure, content-filter refusal, etc.).
+    """
+
+    def __init__(self, url: str, reason: str) -> None:
+        self.url = url
+        self.reason = reason
+        super().__init__(f"LLM extraction failed for '{url}': {reason}")
 
 
 class StorageError(LeadEnrichmentError):
