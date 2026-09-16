@@ -60,7 +60,11 @@ class LLMClient:
     def __init__(self, settings: Settings | None = None) -> None:
         self._settings: Settings = settings or get_settings()
         self._client: AsyncOpenAI = AsyncOpenAI(
-            api_key=self._settings.OPENAI_API_KEY.get_secret_value()
+            api_key=self._settings.OPENAI_API_KEY.get_secret_value(),
+            # Forward a custom base URL only when explicitly configured —
+            # omitting the kwarg entirely lets the SDK default to the
+            # official OpenAI endpoint without any None-handling quirks.
+            **({"base_url": self._settings.OPENAI_BASE_URL} if self._settings.OPENAI_BASE_URL else {}),
         )
 
     async def enrich_lead(self, url: str, markdown_content: str) -> EnrichedLeadPayload:

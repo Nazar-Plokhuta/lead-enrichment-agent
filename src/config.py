@@ -7,6 +7,7 @@ are never leaked in tracebacks or log output.
 """
 
 from functools import lru_cache
+from typing import Optional
 
 from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -24,6 +25,9 @@ class Settings(BaseSettings):
     # --- LLM ---
     OPENAI_API_KEY: SecretStr
     OPENAI_MODEL: str = "gpt-4o-mini"
+    # Optional base URL override — set to route requests through OpenRouter,
+    # a self-hosted proxy, or any OpenAI-compatible endpoint.
+    OPENAI_BASE_URL: Optional[str] = None
 
     # --- Persistence ---
     DATABASE_PATH: str = "leads.db"
