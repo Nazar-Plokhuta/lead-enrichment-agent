@@ -1,0 +1,17 @@
+# Lead-enrichment agent — pinned runtime dependencies
+# Install with:  pip install -r requirements.txt
+# After install: python -m playwright install chromium
+
+# --- Scraping ---
+playwright>=1.44.0
+trafilatura>=2.0.0
+
+# --- LLM ---
+openai>=1.30.0
+
+# --- Data validation & settings ---
+pydantic>=2.7.0
+pydantic-settings>=2.3.0
+
+# --- Persistence ---
+aiosqlite>=0.20.0
