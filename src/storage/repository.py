@@ -22,7 +22,6 @@ writes invisible to other connections and silently rolled back on close.
 from __future__ import annotations
 
 import logging
-from typing import Optional
 
 from src.llm.schemas import EnrichedLeadPayload
 from src.storage.database import get_db_connection
@@ -49,7 +48,7 @@ class LeadRepository:
     # Reads
     # ------------------------------------------------------------------
 
-    async def get_lead_by_url(self, url: str) -> Optional[dict]:  # type: ignore[type-arg]
+    async def get_lead_by_url(self, url: str) -> dict | None:  # type: ignore[type-arg]
         """Fetch a single lead row by its URL.
 
         Used by the orchestrator's idempotency guard to determine whether a URL
@@ -62,12 +61,11 @@ class LeadRepository:
             A plain ``dict`` representation of the row, or ``None`` if no
             record exists for the given URL.
         """
-        async with get_db_connection(self._db_path) as conn:
-            async with conn.execute(
-                "SELECT * FROM leads WHERE url = ?",
-                (url,),
-            ) as cursor:
-                row = await cursor.fetchone()
+        async with get_db_connection(self._db_path) as conn, conn.execute(
+            "SELECT * FROM leads WHERE url = ?",
+            (url,),
+        ) as cursor:
+            row = await cursor.fetchone()
 
         if row is None:
             return None

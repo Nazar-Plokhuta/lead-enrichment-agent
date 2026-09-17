@@ -11,8 +11,8 @@ All higher-level CRUD lives in `storage/repository.py`; this module owns only
 the structural concerns so it can be imported without triggering business logic.
 """
 
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
-from typing import AsyncGenerator
 
 import aiosqlite
 

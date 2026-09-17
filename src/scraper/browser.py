@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import logging
 from types import TracebackType
-from typing import Optional
 
 from playwright.async_api import (
     BrowserContext,
@@ -78,8 +77,8 @@ class BrowserManager:
 
     def __init__(self, *, headless: bool = True) -> None:
         self.headless = headless
-        self._playwright: Optional[Playwright] = None
-        self._context: Optional[BrowserContext] = None
+        self._playwright: Playwright | None = None
+        self._context: BrowserContext | None = None
 
     async def __aenter__(self) -> BrowserContext:
         self._playwright = await async_playwright().start()
@@ -102,16 +101,16 @@ class BrowserManager:
 
     async def __aexit__(
         self,
-        exc_type: Optional[type[BaseException]],
-        exc_val: Optional[BaseException],
-        exc_tb: Optional[TracebackType],
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
     ) -> None:
         """Tear down context → browser → Playwright driver in dependency order."""
         if self._context is not None:
             try:
                 # Closing the context implicitly closes all pages it owns.
                 await self._context.browser.close()  # type: ignore[union-attr]
-            except Exception:
+            except Exception:  # noqa: BLE001
                 logger.warning("Error while closing Chromium browser — forcing Playwright stop")
             finally:
                 self._context = None
@@ -119,7 +118,7 @@ class BrowserManager:
         if self._playwright is not None:
             try:
                 await self._playwright.stop()
-            except Exception:
+            except Exception:  # noqa: BLE001
                 logger.warning("Error while stopping Playwright driver")
             finally:
                 self._playwright = None

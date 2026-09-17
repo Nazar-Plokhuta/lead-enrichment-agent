@@ -18,7 +18,7 @@ system context, directly guiding the model's field population.
 
 from __future__ import annotations
 
-from typing import List, Literal
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -48,7 +48,7 @@ class CompanyAnalysis(BaseModel):
             "Do not invent benefits not mentioned on the site."
         )
     )
-    pain_points: List[str] = Field(
+    pain_points: list[str] = Field(
         description=(
             "Exactly the top 3 customer problems the product or service claims to solve, "
             "extracted verbatim or paraphrased from the page. "
@@ -89,7 +89,7 @@ class LeadScoring(BaseModel):
             "scratchpad that produces the final number."
         )
     )
-    missing_information: List[str] = Field(
+    missing_information: list[str] = Field(
         default_factory=list,
         description=(
             "List of data points that were absent from the page but are required for a "
