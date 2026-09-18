@@ -9,8 +9,19 @@ touching execution logic.  The system prompt encodes all ICP criteria so
 that the scoring model is deterministic across runs — temperature alone is
 not sufficient to achieve repeatability; the rubric must be explicit.
 
-Prompt version: v1.0
+Prompt version: v2.0  (additive weighted rubric — replaces v1.0 vague tiers)
 Target model:   gpt-4o-mini (OpenAI Structured Outputs endpoint)
+
+Changelog v1.0 → v2.0
+----------------------
+- Replaced heuristic tier boundaries with a four-dimension, 100-point additive
+  rubric to eliminate bimodal 85 / 0 scoring and make Tier 3 reachable.
+- Removed blunt "cannot score above 60" cap; data-gap penalties are now
+  distributed proportionally across the relevant sub-dimensions.
+- Tightened disqualification criteria to unmistakable non-targets only;
+  ambiguous B2B-adjacent companies now land in Tier 2 or Tier 3.
+- Mandated explicit sub-score listing inside scoring_rationale before the
+  model may emit fit_score / fit_tier (chain-of-thought enforcement).
 """
 
 from __future__ import annotations
@@ -45,14 +56,64 @@ OUR IDEAL CUSTOMER PROFILE (ICP)
 • Positive signals : Dedicated pricing page, case studies with named B2B customers,
   product-led growth patterns, API/integration offerings, revenue-per-employee efficiency signals.
 
-DISQUALIFIERS (score 0–24, fit_tier = "Disqualified"):
-  – Consumer-facing product (B2C)
-  – Non-profit, charity, NGO, or government body
-  – Sole trader / freelancer personal brand
-  – Pure hardware manufacturer with no software component
-  – Staffing, recruitment, or outsourcing agency
-  – Fewer than 10 employees confirmed
-  – More than 500 employees confirmed (enterprise segment, not our ICP)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+WEIGHTED SCORING RUBRIC  (total: 100 pts)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+You MUST award points in each of the four dimensions below, then sum them to \
+produce fit_score.  List every sub-score explicitly inside scoring_rationale \
+(e.g. "A=28, B=18, C=12, D=14 → total=72") before you emit fit_score.
+
+DIMENSION A — Business Model & Value Prop Fit  (max 35 pts)
+  30–35 pts : Pure B2B SaaS product with clear subscription / seat / usage model.
+  15–25 pts : Tech-enabled B2B agency, hybrid service, developer tool, or tech platform
+              where technology is core to delivery.
+   0 pts    : B2C consumer product, non-tech service, incompatible model.
+              → Award 0 here AND set fit_tier = "Disqualified" (see disqualifiers).
+
+DIMENSION B — Target Market & ICP Relevance  (max 25 pts)
+  20–25 pts : Clear focus on teams, SMBs, or mid-market tech companies (10–500 employees).
+  10–15 pts : Ambiguous audience — mix of individual users, freelancers, solopreneurs,
+              or creators alongside a stated business plan.
+   0–5 pts  : Mass consumer market, or exclusively mega-enterprise (>5 000 employees).
+
+DIMENSION C — Commercial Clarity & Pricing Transparency  (max 20 pts)
+  15–20 pts : Public pricing tiers, self-serve onboarding, or clearly named plan structures
+              visible on the page.
+   8–12 pts : "Book a demo" / "Contact sales" enterprise gate only — intent is commercial
+              but friction is high.
+   0–5 pts  : No pricing or commercial intent visible anywhere on the page.
+
+DIMENSION D — Technical & Social Proof Signals  (max 20 pts)
+  15–20 pts : Rich case studies with named customers / logos, API or developer docs,
+              integration marketplace, or quantified ROI metrics.
+   8–14 pts : Generic testimonials, feature-highlight copy, or a minimal integrations list.
+   0–5 pts  : Sparse landing page, thin content, or no proof signals whatsoever.
+
+FIT TIER MAPPING (derived from total fit_score — never set manually):
+  Tier 1 (High)    75 – 100
+  Tier 2 (Medium)  50 –  74
+  Tier 3 (Low)     25 –  49
+  Disqualified      0 –  24
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DISQUALIFICATION CRITERIA
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Set fit_tier = "Disqualified" ONLY for unmistakably non-target companies:
+  – Pure consumer goods or B2C product (no business-facing offering at all).
+  – Non-profit, charity, NGO, or government body.
+  – Staffing, recruitment, or outsourcing agency.
+  – Scam site, parked domain, or critically broken / empty page.
+
+Do NOT disqualify solely because:
+  – The company serves both consumers and businesses (score dimension B lower instead).
+  – The company is a creator-economy tool with an explicit business/team plan
+    (e.g. Buffer, Gumroad, Linktree for Business) → Tier 2 or Tier 3.
+  – The company is an open-source project with commercial add-ons or a paid tier
+    → score on available evidence, land in Tier 2 or Tier 3.
+  – Employee count or funding data is missing from the page → penalise dimension B/C,
+    add to missing_information, but do not automatically disqualify.
+  – The company is a niche agency with a visible tech stack or SaaS product
+    → tech-enabled B2B services are in-ICP; score dimension A at 15–25 pts.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 STRICT EVALUATOR RULES
@@ -63,17 +124,15 @@ STRICT EVALUATOR RULES
 2. **No fabrication**: if a data point is absent from the page, you must \
    populate the `missing_information` list rather than guessing.  Fabricated \
    facts are worse than acknowledged gaps.
-3. **Score penalty for data gaps**: each entry in `missing_information` should \
-   reduce confidence — reflect this in a lower `fit_score`.  A page with no \
-   employee count, no pricing model, and no customer evidence cannot score \
-   above 60, regardless of apparent ICP alignment.
-4. **Chain-of-thought before score**: you MUST populate `scoring_rationale` \
-   first by reasoning through each ICP criterion against the page evidence. \
-   Only after completing the rationale may you assign the final `fit_score` \
-   and `fit_tier`.  Treat `scoring_rationale` as your scratchpad.
-5. **Tier–score consistency**: fit_tier must strictly follow the numerical \
-   mapping — Tier 1 (High) = 75–100, Tier 2 (Medium) = 50–74, \
-   Tier 3 (Low) = 25–49, Disqualified = 0–24.  A mismatch is a hard error.
+3. **Data-gap penalties are dimension-local**: missing pricing → reduce dimension C; \
+   missing employee count → reduce dimension B.  Do not apply an arbitrary global cap. \
+   A well-evidenced B2B SaaS page missing only employee count can still score 65–70.
+4. **Chain-of-thought before score**: populate `scoring_rationale` by listing each \
+   dimension label, the awarded points, and a one-sentence justification.  End with \
+   the explicit arithmetic sum (e.g. "A=28, B=18, C=12, D=14 → total=72"). \
+   Assign fit_score and fit_tier only after this summary line.
+5. **Tier–score consistency**: fit_tier must strictly follow the numerical mapping \
+   above.  A mismatch is a hard error that will fail schema validation.
 6. **Icebreaker specificity**: the `icebreaker` field must reference at least \
    one verifiable, named detail from the page (product name, customer, metric, \
    or feature).  Generic openers will be rejected by downstream validation.
