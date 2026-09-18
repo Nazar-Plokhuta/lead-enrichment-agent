@@ -35,6 +35,13 @@ import logging
 from typing import Literal
 from urllib.parse import urlparse
 
+import aiosqlite
+from rich.console import Console
+from rich.logging import RichHandler
+from rich.panel import Panel
+from rich.table import Table
+from rich.text import Text
+
 from src.config import get_settings
 from src.core.exceptions import LLMExtractionError, ScrapeError
 from src.llm.client import LLMClient
@@ -43,17 +50,51 @@ from src.storage.database import init_db
 from src.storage.repository import LeadRepository
 
 # ---------------------------------------------------------------------------
-# Logging bootstrap
+# Console & logging bootstrap
 # ---------------------------------------------------------------------------
 
 settings = get_settings()
 
+# Structured output (summary panel, results table) goes to stdout so that
+# piped workflows can separate machine-readable signal from log noise.
+_console = Console()
+
+# Logs route to stderr via RichHandler; this keeps stdout clean for
+# downstream consumers (jq, tee, etc.).  The format string is intentionally
+# minimal — Rich renders level labels and timestamps natively with colour.
 logging.basicConfig(
     level=settings.LOG_LEVEL.upper(),
-    format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
-    datefmt="%Y-%m-%dT%H:%M:%S",
+    format="%(message)s",
+    datefmt="[%X]",
+    handlers=[
+        RichHandler(
+            console=Console(stderr=True),
+            rich_tracebacks=True,
+            show_path=False,
+            markup=False,
+            log_time_format="[%X]",
+            # Disable Rich's regex-based auto-highlighter so that quoted
+            # strings, numbers, and URLs inside log messages are not
+            # coloured; only the level badge and timestamp get styling.
+            highlighter=None,
+        )
+    ],
 )
 logger = logging.getLogger(__name__)
+# Prevent the root basicConfig handler from being inherited a second time
+# if this module is imported by a wrapper (e.g. scripts/demo_run.py).
+logger.propagate = True
+
+# ---------------------------------------------------------------------------
+# Tier → colour mapping (mirrors LeadScoring.fit_tier Literal values)
+# ---------------------------------------------------------------------------
+
+_TIER_STYLES: dict[str, str] = {
+    "Tier 1 (High)": "bold green",
+    "Tier 2 (Medium)": "bold bright_yellow",
+    "Tier 3 (Low)": "bold cyan",
+    "Disqualified": "bold red",  # vibrant, not dim — dim renders as murky grey
+}
 
 # ---------------------------------------------------------------------------
 # Domain helpers
@@ -75,6 +116,72 @@ def _extract_domain(url: str) -> str:
         The ``netloc`` component of the URL (e.g. ``"www.example.com"``).
     """
     return urlparse(url).netloc
+
+
+# ---------------------------------------------------------------------------
+# Results table
+# ---------------------------------------------------------------------------
+
+
+async def _print_results_table(db_path: str, urls: list[str]) -> None:
+    """Query enriched results for *urls* and render a coloured Rich table.
+
+    Rows are ordered by ``fit_score`` descending so the highest-value leads
+    appear first, regardless of the original URL submission order.  Failed or
+    skipped rows appear at the bottom with a ``—`` score.
+
+    Output is written to ``_console`` (stdout) so it does not interleave with
+    the log stream on stderr.
+
+    Args:
+        db_path: Filesystem path to the SQLite database.
+        urls:    The exact list of URLs submitted in this run; scopes the
+                 query to the current batch rather than the full history.
+    """
+    placeholders = ", ".join("?" * len(urls))
+    async with aiosqlite.connect(db_path) as conn:
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute(
+            f"SELECT url, company_name, fit_score, fit_tier, status "
+            f"FROM leads WHERE url IN ({placeholders}) "
+            f"ORDER BY fit_score DESC NULLS LAST",
+            urls,
+        ) as cursor:
+            rows = await cursor.fetchall()
+
+    table = Table(
+        title="[bold white]Enrichment Results[/bold white]",
+        show_header=True,
+        header_style="bold white on grey23",
+        border_style="bright_black",
+        expand=False,
+        show_lines=False,
+    )
+    table.add_column("Company", min_width=22, max_width=32, no_wrap=True)
+    table.add_column("Score", justify="right", min_width=5)
+    table.add_column("Tier", min_width=20)
+    table.add_column("Status", min_width=11)
+
+    for row in rows:
+        company: str = row["company_name"] or "—"
+        score: str = str(row["fit_score"]) if row["fit_score"] is not None else "—"
+        tier_str: str = row["fit_tier"] or "—"
+        status: str = row["status"] or "—"
+
+        status_style = (
+            "green" if status == "PROCESSED"
+            else "red" if status == "FAILED"
+            else "yellow"
+        )
+
+        table.add_row(
+            Text(company, style="bold white"),
+            score,
+            Text(tier_str, style=_TIER_STYLES.get(tier_str, "white")),
+            Text(status, style=status_style),
+        )
+
+    _console.print(table)
 
 
 # ---------------------------------------------------------------------------
@@ -197,8 +304,8 @@ async def main() -> None:
     """Async orchestration entry point.
 
     Parses CLI arguments, initialises the database schema, and fans out
-    per-URL pipeline tasks under a shared semaphore.  A console summary is
-    printed once all tasks complete.
+    per-URL pipeline tasks under a shared semaphore.  A Rich summary panel
+    and a coloured results table are printed once all tasks complete.
     """
     parser = _build_arg_parser()
     args = parser.parse_args()
@@ -237,20 +344,35 @@ async def main() -> None:
     results: list[Literal["processed", "skipped", "failed"]] = await asyncio.gather(*tasks)
 
     # -----------------------------------------------------------------
-    # Console summary
+    # Run summary panel
     # -----------------------------------------------------------------
     processed_count = results.count("processed")
     skipped_count = results.count("skipped")
     failed_count = results.count("failed")
 
-    print("\n" + "=" * 60)
-    print("  Lead Enrichment Agent — Run Summary")
-    print("=" * 60)
-    print(f"  Total URLs submitted : {len(urls)}")
-    print(f"  Successfully enriched: {processed_count}")
-    print(f"  Failed               : {failed_count}")
-    print(f"  Skipped (processed)  : {skipped_count}")
-    print("=" * 60 + "\n")
+    summary_lines = [
+        f"  [white]Total submitted :[/white]  [bold]{len(urls)}[/bold]",
+        f"  [white]Enriched        :[/white]  [bold green]{processed_count}[/bold green]",
+        f"  [white]Failed          :[/white]  [bold red]{failed_count}[/bold red]",
+        f"  [white]Skipped         :[/white]  [bold yellow]{skipped_count}[/bold yellow]",
+    ]
+    _console.print()
+    _console.print(
+        Panel(
+            "\n".join(summary_lines),
+            title="[bold]Lead Enrichment Agent — Run Summary[/bold]",
+            border_style="bright_black",
+            expand=False,
+            padding=(0, 1),
+        )
+    )
+
+    # -----------------------------------------------------------------
+    # Per-lead coloured results table
+    # -----------------------------------------------------------------
+    _console.print()
+    await _print_results_table(settings.DATABASE_PATH, urls)
+    _console.print()
 
     if failed_count > 0:
         logger.warning(
