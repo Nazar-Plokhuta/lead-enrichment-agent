@@ -1,6 +1,6 @@
 # B2B Lead Enrichment & Scoring Agent
 
-[![CI Pipeline](https://github.com/Nazar-Plokhuta/lead-enrichment-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/Nazar-Plokhuta/lead-enrichment-agent/actions/workflows/ci.yml) ![Python Version](https://img.shields.io/badge/python-3.11%2B-blue.svg) ![License: MIT](https://img.shields.io/badge/license-MIT-green.svg) ![Code Style: Ruff](https://img.shields.io/badge/code%20style-ruff-000000.svg)
+[![CI Pipeline](https://github.com/Nazar-Plokhuta/lead-enrichment-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/Nazar-Plokhuta/lead-enrichment-agent/actions/workflows/ci.yml) ![Python Version](https://img.shields.io/badge/python-3.11%2B-blue.svg) ![License: MIT](https://img.shields.io/badge/license-MIT-green.svg) ![Code Style: Ruff](https://img.shields.io/badge/code%20style-ruff-000000.svg) [![Latest Release](https://img.shields.io/github/v/release/Nazar-Plokhuta/lead-enrichment-agent?color=blue)](https://github.com/Nazar-Plokhuta/lead-enrichment-agent/releases)
 
 A high-performance, fully asynchronous pipeline that crawls target company domains, extracts semantic Markdown, and computes deterministic ICP fit scores using LLM Structured Outputs.  Results are persisted to SQLite with full audit trails, idempotency guarantees, and bounded concurrency.
 
@@ -169,16 +169,14 @@ python -m src.main https://linear.app --force
 
 **Console output on completion**:
 
-```
-============================================================
-  Lead Enrichment Agent — Run Summary
-============================================================
-  Total URLs submitted : 2
-  Successfully enriched: 2
-  Failed               : 0
-  Skipped (processed)  : 0
-============================================================
-```
+As of **v1.1.0**, the agent renders a fully styled terminal experience powered by [`rich`](https://github.com/Textualize/rich):
+
+- **Coloured telemetry logs** — each pipeline stage (scrape → extract → persist) is printed with severity-coloured prefixes and structured context (URL, elapsed time, status).
+- **Live execution status** — a `rich` live display tracks in-flight tasks in real time, showing which URLs are currently being scraped or scored.
+- **Native summary table** — on completion, a formatted table is printed with per-URL outcomes (company name, fit score, fit tier, status), followed by aggregate counters for enriched, failed, and skipped records.
+
+<!-- Terminal demo recording -->
+![Lead Enrichment Agent CLI Demo](assets/demo.gif)
 
 ### 4. Query results
 
@@ -255,3 +253,4 @@ quantified score penalty defined in the system prompt.
 | Schema validation | `pydantic` | ≥ 2.7.0 |
 | Settings | `pydantic-settings` | ≥ 2.3.0 |
 | Persistence | `aiosqlite` | ≥ 0.20.0 |
+| CLI & Formatting | `rich` | ≥ 13.7.0 |
