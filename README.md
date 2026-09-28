@@ -1,6 +1,9 @@
 # B2B Lead Enrichment & Scoring Agent
 
-[![CI Pipeline](https://github.com/Nazar-Plokhuta/lead-enrichment-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/Nazar-Plokhuta/lead-enrichment-agent/actions/workflows/ci.yml) ![Python Version](https://img.shields.io/badge/python-3.11%2B-blue.svg) ![License: MIT](https://img.shields.io/badge/license-MIT-green.svg) ![Code Style: Ruff](https://img.shields.io/badge/code%20style-ruff-000000.svg) [![Latest Release](https://img.shields.io/github/v/release/Nazar-Plokhuta/lead-enrichment-agent?color=blue)](https://github.com/Nazar-Plokhuta/lead-enrichment-agent/releases)
+[![Release](https://img.shields.io/github/v/release/Nazar-Plokhuta/lead-enrichment-agent?style=for-the-badge&color=2563EB&logo=github&logoColor=white)](https://github.com/Nazar-Plokhuta/lead-enrichment-agent/releases)
+[![CI Pipeline](https://img.shields.io/github/actions/workflow/status/Nazar-Plokhuta/lead-enrichment-agent/ci.yml?branch=main&style=for-the-badge&logo=githubactions&logoColor=white&label=CI%20Pipeline)](https://github.com/Nazar-Plokhuta/lead-enrichment-agent/actions)
+[![Python 3.11+](https://img.shields.io/badge/Python-3.11+-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
+[![Pydantic v2](https://img.shields.io/badge/Pydantic-v2-E92063?style=for-the-badge&logo=pydantic&logoColor=white)](https://docs.pydantic.dev/)
 
 A high-performance, fully asynchronous pipeline that crawls target company domains, extracts semantic Markdown, and computes deterministic ICP fit scores using LLM Structured Outputs.  Results are persisted to SQLite with full audit trails, idempotency guarantees, and bounded concurrency.
 
