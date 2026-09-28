@@ -15,3 +15,6 @@ pydantic-settings>=2.3.0
 
 # --- Persistence ---
 aiosqlite>=0.20.0
+
+# --- CLI & Terminal UI ---
+rich>=13.7.0
