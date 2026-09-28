@@ -5,8 +5,8 @@
 > preserved as the codebase evolves.  This document is a living record; update
 > it whenever a design decision changes.
 >
-> **Last updated**: 2026-09-17  
-> **Pipeline status**: End-to-end verified against live targets (linear.app).
+> **Last updated**: 2026-09-28  
+> **Pipeline status**: End-to-end verified against live targets (linear.app).  Schema and ICP-rubric contracts are locked by 21 offline deterministic tests (`pytest`); `ruff check src/` is clean.
 
 ---
 
@@ -166,16 +166,35 @@ EnrichedLeadPayload
 │   ├── industry: str
 │   ├── target_audience: str
 │   ├── value_proposition: str
-│   └── pain_points: List[str]        (exactly 3, verified from page)
+│   └── pain_points: list[str]         (up to 3, taken from the page)
 ├── scoring: LeadScoring
-│   ├── fit_tier: Literal[...]         (4 tier values)
-│   ├── fit_score: int                 (ge=0, le=100)
-│   ├── scoring_rationale: str         (chain-of-thought before score)
-│   └── missing_information: List[str] (acknowledged data gaps)
+│   ├── fit_tier: Literal[...]         (4 tier values; JSON schema enum)
+│   ├── fit_score: int                 (ge=0, le=100; JSON minimum/maximum)
+│   ├── scoring_rationale: str         (chain-of-thought, then one arithmetic line)
+│   └── missing_information: list[str] (default []; omitted from JSON required)
 └── outreach: OutreachStrategy
-    ├── icebreaker: str                (must reference verifiable page detail)
+    ├── icebreaker: str                (must reference a verifiable page detail)
     └── suggested_angle: str
 ```
+
+`pain_points` is a `list[str]`.  The field description asks for the top three
+problems found on the page.  When the page supports fewer, the list is shorter
+and the gap is recorded on `LeadScoring.missing_information`.  A length of
+three is requested in that description.  The Pydantic type accepts any list.
+
+`EnrichedLeadPayload.model_json_schema()` is the document the regression suite
+treats as the structured-output contract.  Required top-level keys are
+`company_name`, `analysis`, `scoring`, and `outreach`.  Nested `$defs` are
+exactly `CompanyAnalysis`, `LeadScoring`, and `OutreachStrategy`.
+`CompanyAnalysis.required` is `industry`, `target_audience`,
+`value_proposition`, `pain_points`.  `OutreachStrategy.required` is
+`icebreaker`, `suggested_angle`.  `LeadScoring.required` is `fit_tier`,
+`fit_score`, and `scoring_rationale`.  `missing_information` carries
+`default_factory=list`, so an omitted key validates as an empty list and the
+key is absent from that model's `required` array.  `fit_tier` is a `Literal`
+of `Tier 1 (High)`, `Tier 2 (Medium)`, `Tier 3 (Low)`, and `Disqualified`,
+which the JSON schema publishes as an enum.  `fit_score` is an `int` with
+`ge=0` and `le=100`, published as `minimum` / `maximum`.
 
 All `Field(description=...)` strings are deliberately verbose because the
 OpenAI SDK serialises them into the JSON schema injected into the model's system
@@ -189,26 +208,74 @@ free-form tier labels.
 
 ### 3.2 `prompts.py` — ICP Rubric & Prompt Templates
 
-The system prompt encodes the full ICP definition and seven strict evaluator
-rules in a single versioned constant (`SYSTEM_PROMPT_TEMPLATE`, v1.0).
+The system prompt encodes the ICP definition, a four-dimension additive
+rubric, disqualification rules, and seven evaluator rules in one versioned
+constant (`SYSTEM_PROMPT_TEMPLATE`, **v2.0**).  v2.0 replaced the v1.0
+heuristic tiers, which collapsed scores toward 85 or 0 and left Tier 3
+unreachable.  Data-gap penalties are now local to the dimension the gap
+affects.  The module docstring is the changelog.
 
-**ICP definition** (single source of truth):
-- Business model: B2B SaaS or tech-enabled B2B services.
+**ICP definition** (single source of truth, also reflected in the schema
+field descriptions):
+- Business model: B2B SaaS or tech-enabled B2B services (technology is core
+  to delivery, not a thin CRM wrapper).
 - Company size: 10–500 employees (growth-stage; Seed through Series C).
-- Disqualifiers: B2C, NGO/government, sole traders, pure hardware, staffing agencies, <10 or >500 employees.
+  Pre-revenue or bootstrapped SMBs stay in range when employee count and a
+  B2B model are confirmed.
+- Disqualifiers, applied only to unmistakable non-targets: pure B2C with no
+  business-facing offering, NGO/government, staffing or recruitment agencies,
+  scam sites, parked domains, and empty pages.  Mixed consumer/business
+  audiences, creator tools with a business plan, and open-source projects
+  with a paid tier are scored into Tier 2 or Tier 3.  A missing employee
+  count or a niche tech-enabled agency lowers the affected dimension and
+  leaves the company inside a scored tier.
 
-**Key rubric rules** that enforce determinism:
-1. Facts only — no external knowledge or hallucination.
-2. `scoring_rationale` must be populated *before* assigning `fit_score` — the
-   prompt explicitly frames the rationale field as the chain-of-thought
-   scratchpad.
-3. Tier–score consistency is declared a "hard error" in the prompt.
-4. Each `missing_information` entry must reduce the `fit_score` — data gaps
-   have a quantified cost.
+**Weighted rubric** (100 points, summed into `fit_score`):
+
+| Dimension | Ceiling | Bands the prompt publishes |
+|---|---|---|
+| A — Business model & value proposition | 35 | 30–35 pure B2B SaaS; 15–25 tech-enabled B2B service; 0 incompatible model |
+| B — Target market & ICP relevance | 25 | 20–25 teams / SMB / mid-market; 10–15 ambiguous audience; 0–5 consumer or mega-enterprise |
+| C — Commercial clarity & pricing | 20 | 15–20 public tiers or self-serve; 8–12 demo / contact-sales only; 0–5 no commercial intent |
+| D — Technical & social proof | 20 | 15–20 named case studies, API, or quantified ROI; 8–14 generic proof; 0–5 none |
+
+**FIT TIER MAPPING** (derived from the total; the prompt forbids setting the
+tier independently of `fit_score`):
+
+| Tier | Inclusive band |
+|---|---|
+| Tier 1 (High) | 75–100 |
+| Tier 2 (Medium) | 50–74 |
+| Tier 3 (Low) | 25–49 |
+| Disqualified | 0–24 |
+
+An incompatible model scores 0 on dimension A and sets `fit_tier` to
+`Disqualified`.  The offline suite parses these four lines out of
+`SYSTEM_PROMPT_TEMPLATE` and requires them to match its oracle, so a band
+edit and the tests move together.  See D-06.
+
+**Evaluator rules** that the golden cases exercise:
+1. Facts only — every field comes from the provided page text.
+2. Absent data goes to `missing_information` rather than a guessed value.
+3. Data-gap penalties are dimension-local: missing pricing reduces C, missing
+   employee count reduces B.  Penalties stay inside the affected dimension.
+   A well-evidenced B2B SaaS page missing only headcount can still score 65–70.
+4. Chain-of-thought before the score.  `scoring_rationale` lists each
+   dimension, the awarded points, and a one-sentence justification, and ends
+   with exactly one arithmetic line (`A=28, B=18, C=12, D=14 → total=72` is
+   the prompt's example shape).  `fit_score` and `fit_tier` are assigned
+   after that line.
+5. Tier–score consistency.  The prompt calls a mismatch a hard error.  The
+   regression suite treats it as a failed case.
+6. `icebreaker` cites at least one named detail from the page (product,
+   customer, metric, or feature).
+7. `company_name` is the trading name taken from the page (title, logo, or
+   About).
 
 `build_user_prompt` wraps the URL and Markdown in a structured fence
 (`--- BEGIN PAGE CONTENT ---` / `--- END PAGE CONTENT ---`) so the model's
-context boundary is unambiguous.
+context boundary is unambiguous.  The Markdown argument is the Trafilatura
+output, already truncated to the scraper character budget.
 
 ### 3.3 `client.py` — OpenAI Structured Outputs Client
 
@@ -432,3 +499,96 @@ slower than a direct column predicate and requires knowledge of the schema
 structure in every query.  Denormalised columns allow `WHERE fit_score > 75`,
 `ORDER BY fit_score DESC`, and `GROUP BY domain` without JSON path access,
 making the database directly queryable by standard SQL tooling.
+
+### D-06: Deterministic Offline Regression Testing for LLM Structured Outputs & Rubric Tiers
+
+**Decision**: Lock the `EnrichedLeadPayload` structured-output contract and the
+v2.0 ICP tier bands with an offline pytest suite
+(`tests/test_scoring_regression.py`, `tests/test_schemas.py`,
+`tests/fixtures/eval/`).  Golden labels are plain dictionaries validated by
+`EnrichedLeadPayload.model_validate` — the same Pydantic contract the OpenAI
+parse path enforces, exercised on a local dict.  An autouse
+fixture replaces `socket.create_connection` so a TCP connect fails the run.
+CI (`.github/workflows/ci.yml`) installs `ruff`, `pytest`, and
+`pytest-asyncio`, runs `ruff check src/`, then `pytest tests/ -v`, and exports
+a mock `OPENAI_API_KEY` that this suite never reads.
+
+**Rationale**: Structured Outputs make a live response schema-shaped, and
+temperature `0.1` still leaves `scoring_rationale` and `icebreaker` free to
+vary between calls.  A CI job that called OpenAI would flake on sampling,
+spend tokens on every push, and notice a moved tier band only after someone
+re-read a live score.  The suite splits that risk into checks whose inputs
+are files in the repository:
+
+1. **Prompt drift.**  `test_offline_bands_match_published_prompt` parses the
+   en-dash tier lines out of `SYSTEM_PROMPT_TEMPLATE` and requires them to
+   equal the in-suite oracle: Tier 1 (High) 75–100, Tier 2 (Medium) 50–74,
+   Tier 3 (Low) 25–49, Disqualified 0–24.  Inclusive edges (0, 24, 25, 49,
+   50, 74, 75, 100) must each map to exactly one tier and pass
+   `LeadScoring`.  Every integer from 0 through 100 belongs to exactly one
+   band.
+2. **Schema contract stability.**  `model_json_schema()` must keep the
+   required keys of `EnrichedLeadPayload`, `CompanyAnalysis`, `LeadScoring`,
+   and `OutreachStrategy`, the `fit_tier` enum, and `fit_score` as an integer
+   with `minimum` 0 and `maximum` 100.  `missing_information` stays out of
+   `LeadScoring.required` because the field has a default.  Scores below 0,
+   scores above 100, and tier labels outside the `Literal` (`Tier 4 (Ultra)`,
+   `high`) raise `ValidationError` with the expected `loc` and `type`.  A
+   JSON round-trip (`model_dump_json` → `model_validate_json`) must reproduce
+   the golden payload, which is the shape stored in `enriched_data`.
+3. **Rubric arithmetic and evidence.**  Each golden rationale contains exactly
+   one `A=…, B=…, C=…, D=… → total=…` line.  Sub-scores stay inside the
+   dimension ceilings (35 / 25 / 20 / 20), sum to `fit_score`, and sit in the
+   business-model band for that archetype.  A Disqualified label awards 0 on
+   dimension A.  Company name, pain points, evidence anchors, and the
+   icebreaker's cited detail must occur in the fixture page.
+
+A green run spends no OpenAI tokens and performs no provider round-trip.  CI
+failures on this suite are contract diffs: a moved band, a renamed field, a
+`Literal` change, a fixture whose evidence is missing from the page, or
+sub-scores that disagree with `fit_score`.  The live `linear.app` enrichment remains
+the end-to-end behavioral check.  This suite is the contract gate in front
+of it.
+
+**Tradeoffs**: Golden pages and expected scores are maintained by hand.  The
+three fixtures cover a pure B2B SaaS Tier 1 page (Forgeboard, 92), a
+tech-enabled consulting Tier 2 page (Harborline Partners, 54), and a B2C
+catalog that must be Disqualified (Willow & Grain, 11).  Tier 3 coverage in
+this revision is the inclusive edges 25 and 49 together with the full 0–100
+partition.  The socket patch guards `socket.create_connection`, which is the
+connect path the suite is written to forbid.  The tests construct no
+`LLMClient`.  A later HTTP client that connects through a different socket
+API would need the same isolation extended in the fixture.  The suite accepts
+a label that satisfies the rubric and the schema.  Live model sampling stays
+on the manual enrichment path, so a wording change that keeps the bands can
+still move a real score until the next live run.
+
+---
+
+## 8. `tests/` — Offline Evaluation Suite
+
+### Module Map
+
+| Path | Responsibility |
+|---|---|
+| `pytest.ini` | `pythonpath = .` and `testpaths = tests`.  Bare `pytest` imports `src` without an editable install. |
+| `test_schemas.py` | Happy-path `EnrichedLeadPayload` construction and rejection of `LeadScoring.fit_score` above 100. |
+| `test_scoring_regression.py` | Golden-set rubric checks, band edges, negative schema cases, JSON-schema shape, prompt-band parity, fixture registration. |
+| `fixtures/eval/*.md` | Scraped-page stand-ins.  The set of `*.md` names must equal the registered `_EVAL_CASES`. |
+
+### What the 21 tests cover
+
+| Group | Count | Contract under test |
+|---|---|---|
+| Golden fixtures | 3 | `tier1_saas.md` (92, Tier 1), `tier2_consulting.md` (54, Tier 2), `disqualified_b2c.md` (11, Disqualified).  Grounding, dimension arithmetic, tier band, DTO round-trip. |
+| Inclusive band edges | 8 | 100, 75, 74, 50, 49, 25, 24, 0.  Each edge is a valid `LeadScoring` and maps to one tier. |
+| Rejected `LeadScoring` bodies | 4 | `fit_score=-1` (`greater_than_equal`), `fit_score=101` (`less_than_equal`), `Tier 4 (Ultra)` and `high` (`literal_error` on `fit_tier`). |
+| Contract invariants | 4 | JSON schema shape for the four DTOs; prompt-band parity with `SYSTEM_PROMPT_TEMPLATE`; partition of scores 0–100; on-disk fixtures match registered cases. |
+| `test_schemas.py` | 2 | One valid `EnrichedLeadPayload`; `fit_score=150` raises `ValidationError`. |
+| **Total** | **21** | |
+
+Current cases are synchronous Pydantic and rubric checks.  CI also installs
+`pytest-asyncio` next to `pytest` and `ruff`, so an async test added later
+uses the same job.  Ruff is scoped to `ruff check src/`, matching the
+workflow.  The decision record for why this suite exists, and what it
+deliberately leaves on the live path, is D-06.

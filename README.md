@@ -104,11 +104,20 @@ lead-enrichment-agent/
 │   └── storage/
 │       ├── database.py        # Schema DDL, init_db, connection context manager
 │       └── repository.py      # CRUD against the leads table
+├── tests/
+│   ├── fixtures/
+│   │   └── eval/              # Golden Markdown pages for offline rubric regression
+│   │       ├── tier1_saas.md
+│   │       ├── tier2_consulting.md
+│   │       └── disqualified_b2c.md
+│   ├── test_schemas.py        # Pydantic v2 DTO smoke tests
+│   └── test_scoring_regression.py  # Deterministic ICP scoring regression suite
 ├── docs/
 │   └── internal/
 │       ├── architecture.md    # High-level design specification
 │       └── state.md           # Current implementation state & decision log
 ├── .env.example               # Environment variable reference
+├── pytest.ini                 # Pytest discovery (`pythonpath`, `testpaths`)
 └── requirements.txt           # Pinned runtime dependencies
 ```
 
@@ -186,6 +195,64 @@ As of **v1.1.0**, the agent renders a fully styled terminal experience powered b
 sqlite3 leads.db "SELECT url, company_name, fit_score, fit_tier, status FROM leads ORDER BY fit_score DESC;"
 ```
 
+### Testing & Verification
+
+`requirements.txt` pins runtime libraries only.  Verification tools match the
+CI install in `.github/workflows/ci.yml`:
+
+```bash
+pip install ruff pytest pytest-asyncio
+pytest
+ruff check src/
+```
+
+`pytest.ini` sets `pythonpath = .` and `testpaths = tests`, so a bare `pytest`
+collects the suite and imports `src` without an editable install.  CI runs
+`ruff check src/` and then `pytest tests/ -v`, exporting a mock
+`OPENAI_API_KEY` that the tests never read.
+
+**Deterministic offline regression.**  `tests/test_scoring_regression.py`
+validates ICP rubric scoring and the structured-output contract on local data.
+Golden Markdown pages in `tests/fixtures/eval/` stand in for Trafilatura
+output.  Each page is paired with an expected `EnrichedLeadPayload` label.
+The suite checks:
+
+- Schema acceptance through `EnrichedLeadPayload.model_validate` — the same
+  Pydantic contract `client.beta.chat.completions.parse` enforces — plus a
+  JSON round-trip (`model_dump_json` → `model_validate_json`).
+- Tier consistency against the v2.0 inclusive bands (Tier 1: 75–100, Tier 2:
+  50–74, Tier 3: 25–49, Disqualified: 0–24), including the eight boundary
+  scores 0, 24, 25, 49, 50, 74, 75, and 100.
+- Rubric arithmetic.  `scoring_rationale` must contain exactly one
+  `A=…, B=…, C=…, D=… → total=…` line.  Sub-scores stay inside the dimension
+  ceilings (35 / 25 / 20 / 20), sum to `fit_score`, and fall in the
+  business-model band for that archetype.  A Disqualified label awards 0 on
+  dimension A.
+- Evidence grounding.  Company name, pain points, evidence anchors, and the
+  detail cited by `icebreaker` must appear in the fixture page.
+- Negative schema assertions.  `fit_score` below 0, `fit_score` above 100, and
+  tier labels outside the `Literal` (`Tier 4 (Ultra)`, `high`) raise
+  `ValidationError` with the expected Pydantic error type.
+
+An autouse fixture replaces `socket.create_connection`, so a TCP connect fails
+the run.  Labels are validated in-process.  A green run spends no OpenAI
+tokens and waits on no network round-trip.  Prompt drift is caught by parsing
+the tier bands out of `SYSTEM_PROMPT_TEMPLATE` and requiring them to equal the
+in-suite oracle.  `tests/test_schemas.py` adds a happy-path construction of
+`EnrichedLeadPayload` and a direct rejection of an out-of-range
+`LeadScoring.fit_score`.
+
+**Current verification status**: 21 tests passing, and `ruff check src/` is clean.
+
+| Group | Tests | What they lock |
+|---|---|---|
+| Golden fixtures (`tier1_saas`, `tier2_consulting`, `disqualified_b2c`) | 3 | Grounding, sub-scores, tier, DTO round-trip |
+| Inclusive band edges | 8 | 0, 24, 25, 49, 50, 74, 75, 100 |
+| Out-of-contract `LeadScoring` bodies | 4 | Score below 0, score above 100, unknown tier, lowercase tier |
+| Contract invariants | 4 | JSON schema shape, prompt-band parity, 0–100 partition, fixture registration |
+| `test_schemas.py` | 2 | Valid payload, score above 100 rejected |
+| **Total** | **21** | |
+
 ---
 
 ## Example Output
@@ -221,10 +288,12 @@ product-development tool:
 }
 ```
 
-**Score breakdown**: 85/100 → Tier 1 (High).  One penalty applied for the
-missing employee count signal; all other ICP criteria (B2B SaaS, product-led
-growth patterns, integrations/API, named growth-stage customers) confirmed from
-page evidence.
+**Score breakdown**: 85/100 → Tier 1 (High).  The recorded rationale notes the
+missing employee-count signal and confirms the remaining ICP evidence from the
+page (B2B SaaS, product-led growth patterns, integrations/API, named
+growth-stage customers).  This JSON is a live enrichment snapshot.  Band
+edges, tier–score consistency, and the required sub-score line are locked by
+the offline suite under Testing & Verification.
 
 ---
 
@@ -237,10 +306,13 @@ page evidence.
 | 25 – 49 | Tier 3 (Low) | Weak fit; defer or monitor. |
 | 0 – 24 | Disqualified | Does not meet ICP criteria (B2C, NGO, sole trader, enterprise, etc.). |
 
-Scoring is deterministic by rubric: `scoring_rationale` is generated first as a
-chain-of-thought scratchpad; `fit_score` and `fit_tier` are assigned only after
-the rationale is complete.  Each entry in `missing_information` carries a
-quantified score penalty defined in the system prompt.
+Scoring follows the v2.0 additive rubric.  `scoring_rationale` is written
+first as a chain-of-thought scratchpad and must close with one sub-score line
+(`A=…, B=…, C=…, D=… → total=…`).  `fit_score` is that total.  The four
+ceilings are business model (35), target market (25), commercial clarity (20),
+and technical proof (20).  `fit_tier` is derived from the total using the
+bands above.  Gaps are recorded in `missing_information` and reduce only the
+dimension they affect (employee count → B, pricing → C).
 
 ---
 
