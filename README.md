@@ -4,6 +4,8 @@
 
 A high-performance, fully asynchronous pipeline that crawls target company domains, extracts semantic Markdown, and computes deterministic ICP fit scores using LLM Structured Outputs.  Results are persisted to SQLite with full audit trails, idempotency guarantees, and bounded concurrency.
 
+![Lead Enrichment Agent CLI Demo](assets/demo.gif)
+
 ---
 
 ## Architecture
@@ -174,9 +176,6 @@ As of **v1.1.0**, the agent renders a fully styled terminal experience powered b
 - **Coloured telemetry logs** — each pipeline stage (scrape → extract → persist) is printed with severity-coloured prefixes and structured context (URL, elapsed time, status).
 - **Live execution status** — a `rich` live display tracks in-flight tasks in real time, showing which URLs are currently being scraped or scored.
 - **Native summary table** — on completion, a formatted table is printed with per-URL outcomes (company name, fit score, fit tier, status), followed by aggregate counters for enriched, failed, and skipped records.
-
-<!-- Terminal demo recording -->
-![Lead Enrichment Agent CLI Demo](assets/demo.gif)
 
 ### 4. Query results
 
