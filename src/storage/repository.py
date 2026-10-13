@@ -22,14 +22,20 @@ writes invisible to other connections and silently rolled back on close.
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 from src.llm.schemas import EnrichedLeadPayload
-from src.storage.database import get_db_connection
+from src.storage.base import BaseLeadRepository
+from src.storage.database import get_db_connection, init_db
 
 logger = logging.getLogger(__name__)
 
+# SQLite caps bound parameters per statement (999 on builds before 3.32), so
+# IN-lists are chunked well below that limit.
+_IN_CLAUSE_BATCH_SIZE = 500
 
-class LeadRepository:
+
+class LeadRepository(BaseLeadRepository):
     """Async data-access object for lead persistence.
 
     All methods are coroutines and must be awaited.  The repository is
@@ -44,11 +50,15 @@ class LeadRepository:
     def __init__(self, db_path: str) -> None:
         self._db_path = db_path
 
+    async def init_db(self) -> None:
+        """Create the schema if missing; delegates to the idempotent DDL bootstrap."""
+        await init_db(self._db_path)
+
     # ------------------------------------------------------------------
     # Reads
     # ------------------------------------------------------------------
 
-    async def get_lead_by_url(self, url: str) -> dict | None:  # type: ignore[type-arg]
+    async def get_lead_by_url(self, url: str) -> dict[str, Any] | None:
         """Fetch a single lead row by its URL.
 
         Used by the orchestrator's idempotency guard to determine whether a URL
@@ -73,6 +83,32 @@ class LeadRepository:
         # ``aiosqlite.Row`` supports ``dict()`` conversion via its mapping
         # interface; this keeps the caller free from aiosqlite internals.
         return dict(row)
+
+    async def get_leads_by_urls(self, urls: list[str]) -> list[dict[str, Any]]:
+        """Fetch summary rows (``url``, ``company_name``, ``fit_score``,
+        ``fit_tier``, ``status``) for *urls*, highest ``fit_score`` first.
+
+        The lookup is chunked to respect SQLite's bound-parameter limit, so
+        ordering is applied in Python after the chunks are merged; rows without
+        a score sort last.
+
+        Args:
+            urls: URLs to look up; unknown URLs are omitted from the result.
+        """
+        rows: list[dict[str, Any]] = []
+        async with get_db_connection(self._db_path) as conn:
+            for start in range(0, len(urls), _IN_CLAUSE_BATCH_SIZE):
+                chunk = urls[start : start + _IN_CLAUSE_BATCH_SIZE]
+                placeholders = ", ".join("?" * len(chunk))
+                async with conn.execute(
+                    "SELECT url, company_name, fit_score, fit_tier, status "
+                    f"FROM leads WHERE url IN ({placeholders})",
+                    chunk,
+                ) as cursor:
+                    rows.extend(dict(row) for row in await cursor.fetchall())
+
+        rows.sort(key=lambda r: (r["fit_score"] is None, -(r["fit_score"] or 0)))
+        return rows
 
     # ------------------------------------------------------------------
     # Writes

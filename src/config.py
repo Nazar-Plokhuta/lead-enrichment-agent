@@ -7,9 +7,15 @@ are never leaked in tracebacks or log output.
 """
 
 from functools import lru_cache
+from typing import TYPE_CHECKING
 
 from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+if TYPE_CHECKING:
+    from src.storage.base import BaseLeadRepository
+
+_POSTGRES_SCHEMES = ("postgresql://", "postgres://")
 
 
 class Settings(BaseSettings):
@@ -30,6 +36,9 @@ class Settings(BaseSettings):
 
     # --- Persistence ---
     DATABASE_PATH: str = "leads.db"
+    # When set, PostgreSQL replaces SQLite.  SecretStr because the DSN embeds
+    # credentials.
+    DATABASE_URL: SecretStr | None = None
 
     # --- Concurrency & timeouts ---
     MAX_CONCURRENT_SCRAPES: int = 3
@@ -48,3 +57,30 @@ def get_settings() -> Settings:
     re-evaluation with a patched environment.
     """
     return Settings()
+
+
+def get_repository(settings: Settings | None = None) -> "BaseLeadRepository":
+    """Build the repository selected by configuration.
+
+    Returns a ``PostgresLeadRepository`` when ``DATABASE_URL`` is set,
+    otherwise a SQLite ``LeadRepository`` on ``DATABASE_PATH``.  The caller
+    owns the lifecycle: await ``init_db()`` first and ``close()`` when done.
+
+    Raises:
+        ValueError: ``DATABASE_URL`` is set but is not a PostgreSQL DSN.  Falling
+            back to SQLite here would silently write to the wrong store.
+    """
+    settings = settings or get_settings()
+
+    # Deferred import: storage modules import ``src.llm``, which imports this
+    # module, so a top-level import would be circular.
+    from src.storage.postgres import PostgresLeadRepository
+    from src.storage.repository import LeadRepository
+
+    if settings.DATABASE_URL is None:
+        return LeadRepository(settings.DATABASE_PATH)
+
+    dsn = settings.DATABASE_URL.get_secret_value()
+    if not dsn.startswith(_POSTGRES_SCHEMES):
+        raise ValueError("DATABASE_URL must start with 'postgresql://' or 'postgres://'")
+    return PostgresLeadRepository(dsn)

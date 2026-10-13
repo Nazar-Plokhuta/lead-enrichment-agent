@@ -5,11 +5,11 @@ Execution model
 ---------------
 Each URL is processed through a five-stage pipeline:
 
-    1. ``LeadRepository.insert_pending_lead`` — creates (or retrieves) the
+    1. ``insert_pending_lead`` — creates (or retrieves) the
        database record; establishes the lead_id used by all subsequent stages.
     2. ``fetch_page_markdown`` — headless browser scrape + DOM normalisation.
     3. ``LLMClient.enrich_lead`` — structured-output extraction via OpenAI.
-    4. ``LeadRepository.save_lead_success`` — persist enriched payload.
+    4. ``save_lead_success`` — persist enriched payload.
     5. On ``ScrapeError`` or ``LLMExtractionError``: ``mark_lead_failed`` so
        the record is queryable for post-mortem analysis, then continue.
 
@@ -35,19 +35,17 @@ import logging
 from typing import Literal
 from urllib.parse import urlparse
 
-import aiosqlite
 from rich.console import Console
 from rich.logging import RichHandler
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from src.config import get_settings
+from src.config import get_repository, get_settings
 from src.core.exceptions import LLMExtractionError, ScrapeError
 from src.llm.client import LLMClient
 from src.scraper.fetcher import fetch_page_markdown
-from src.storage.database import init_db
-from src.storage.repository import LeadRepository
+from src.storage.base import BaseLeadRepository
 
 # ---------------------------------------------------------------------------
 # Console & logging bootstrap
@@ -123,10 +121,10 @@ def _extract_domain(url: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-async def _print_results_table(db_path: str, urls: list[str]) -> None:
+async def _print_results_table(repo: BaseLeadRepository, urls: list[str]) -> None:
     """Query enriched results for *urls* and render a coloured Rich table.
 
-    Rows are ordered by ``fit_score`` descending so the highest-value leads
+    Rows arrive ordered by ``fit_score`` descending so the highest-value leads
     appear first, regardless of the original URL submission order.  Failed or
     skipped rows appear at the bottom with a ``—`` score.
 
@@ -134,20 +132,11 @@ async def _print_results_table(db_path: str, urls: list[str]) -> None:
     the log stream on stderr.
 
     Args:
-        db_path: Filesystem path to the SQLite database.
+        repo:    Repository used to fetch the batch's result rows.
         urls:    The exact list of URLs submitted in this run; scopes the
                  query to the current batch rather than the full history.
     """
-    placeholders = ", ".join("?" * len(urls))
-    async with aiosqlite.connect(db_path) as conn:
-        conn.row_factory = aiosqlite.Row
-        async with conn.execute(
-            f"SELECT url, company_name, fit_score, fit_tier, status "
-            f"FROM leads WHERE url IN ({placeholders}) "
-            f"ORDER BY fit_score DESC NULLS LAST",
-            urls,
-        ) as cursor:
-            rows = await cursor.fetchall()
+    rows = await repo.get_leads_by_urls(urls)
 
     table = Table(
         title="[bold white]Enrichment Results[/bold white]",
@@ -192,7 +181,7 @@ async def _print_results_table(db_path: str, urls: list[str]) -> None:
 async def _process_url(
     url: str,
     *,
-    repo: LeadRepository,
+    repo: BaseLeadRepository,
     llm_client: LLMClient,
     semaphore: asyncio.Semaphore,
     force: bool,
@@ -204,7 +193,7 @@ async def _process_url(
 
     Args:
         url:        The company URL to enrich.
-        repo:       Shared ``LeadRepository`` instance for all database ops.
+        repo:       Shared repository instance for all database ops.
         llm_client: Shared ``LLMClient`` instance for OpenAI calls.
         semaphore:  Concurrency gate shared across all URL tasks.
         force:      When ``True``, re-enrich URLs already in ``'PROCESSED'``
@@ -242,7 +231,7 @@ async def _process_url(
             # Stage 3 — enrich: Markdown → validated EnrichedLeadPayload.
             payload = await llm_client.enrich_lead(url, markdown)
 
-            # Stage 4 — persist: structured payload → SQLite.
+            # Stage 4 — persist: structured payload → database.
             await repo.save_lead_success(lead_id, payload, markdown)
 
             logger.info(
@@ -279,7 +268,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         prog="lead-enrichment-agent",
         description=(
             "Scrape, enrich, and score B2B company URLs using structured "
-            "LLM extraction.  Results are persisted to SQLite."
+            "LLM extraction.  Results are persisted to SQLite or PostgreSQL."
         ),
     )
     parser.add_argument(
@@ -320,10 +309,18 @@ async def main() -> None:
         settings.MAX_CONCURRENT_SCRAPES,
     )
 
-    # Ensure schema is in place before any pipeline task runs.
-    await init_db(settings.DATABASE_PATH)
+    repo = get_repository(settings)
+    # Ensure schema (and, for Postgres, the connection pool) is ready before
+    # any pipeline task runs.
+    await repo.init_db()
+    try:
+        await _run(repo, urls, force)
+    finally:
+        await repo.close()
 
-    repo = LeadRepository(settings.DATABASE_PATH)
+
+async def _run(repo: BaseLeadRepository, urls: list[str], force: bool) -> None:
+    """Fan out the pipeline over *urls* and print the summary and results table."""
     llm_client = LLMClient(settings)
     semaphore = asyncio.Semaphore(settings.MAX_CONCURRENT_SCRAPES)
 
@@ -371,7 +368,7 @@ async def main() -> None:
     # Per-lead coloured results table
     # -----------------------------------------------------------------
     _console.print()
-    await _print_results_table(settings.DATABASE_PATH, urls)
+    await _print_results_table(repo, urls)
     _console.print()
 
     if failed_count > 0:
