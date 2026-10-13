@@ -24,9 +24,10 @@ services:
         condition: service_healthy
     environment:
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/leads_db
-      LLM_MODEL: gpt-4o-mini
+      LLM_MODEL: ${LLM_MODEL:-gpt-4o-mini}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
     ports:
       - "8000:8000"
     # PID 1 reaps the zombie processes Chromium leaves behind.
