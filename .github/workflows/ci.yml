@@ -14,26 +14,26 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v5
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
         with:
-          python-version: "3.11"
-          cache: "pip"
+          enable-cache: true
+
+      - name: Set up Python 3.11
+        run: uv python install 3.11
 
       - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install ruff pytest pytest-asyncio
+        run: uv sync --dev
+
+      - name: Install Playwright Chromium
+        run: uv run playwright install chromium
 
       - name: Run Ruff Linter
-        run: |
-          ruff check src/
+        run: uv run ruff check src/
 
       - name: Run Pytest Test Suite
         env:
-          OPENAI_API_KEY: "sk-mock-key-for-testing"
+          OPENAI_API_KEY: "mock-ci-key-do-not-call-api"
           OPENAI_MODEL: "gpt-4o-mini"
           DATABASE_PATH: ":memory:"
-        run: |
-          pytest tests/ -v
+        run: uv run pytest tests/ -v
