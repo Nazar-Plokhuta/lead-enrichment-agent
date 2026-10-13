@@ -5,8 +5,11 @@
 > preserved as the codebase evolves.  This document is a living record; update
 > it whenever a design decision changes.
 >
-> **Last updated**: 2026-09-28  
-> **Pipeline status**: End-to-end verified against live targets (linear.app).  Schema and ICP-rubric contracts are locked by 21 offline deterministic tests (`pytest`); `ruff check src/` is clean.
+> **Last updated**: 2026-10-14  
+> **Version**: 2.0.0 (`pyproject.toml` and `API_VERSION` in `src/api/app.py` agree).  
+> **Pipeline status**: CLI and REST API share one `EnrichmentService`.  Storage is SQLite or PostgreSQL, the LLM layer is provider-agnostic through LiteLLM, and browser traffic is SSRF-guarded.  147 offline tests pass (`uv run pytest`); `ruff check src/` and `ruff format --check src/` are clean.  The live `linear.app` run remains the end-to-end behavioural check.
+>
+> **Reading guide**: decisions are recorded in §7 (D-01 … D-12).  Entries superseded by later decisions are annotated, not deleted, so the history stays auditable.
 
 ---
 
@@ -28,27 +31,38 @@ environment without restarting the process.
 
 | Field | Default | Purpose |
 |---|---|---|
-| `OPENAI_API_KEY` | *(required)* | Wrapped in `SecretStr`; passed directly to `AsyncOpenAI`. |
-| `OPENAI_MODEL` | `gpt-4o-mini` | Model identifier forwarded to the completions endpoint. |
-| `OPENAI_BASE_URL` | `None` | Optional base URL override for OpenRouter or self-hosted proxies. |
-| `DATABASE_PATH` | `leads.db` | Filesystem path to the SQLite database file. |
-| `MAX_CONCURRENT_SCRAPES` | `3` | Upper bound for the `asyncio.Semaphore` in the orchestrator. |
+| `LLM_MODEL` | `gpt-4o-mini` | LiteLLM model identifier.  Its prefix selects the provider and therefore the API key (see D-07).  Replaces the v1 `OPENAI_MODEL`. |
+| `OPENAI_API_KEY` | `None` | `SecretStr`.  Required only when `LLM_MODEL` resolves to OpenAI. |
+| `ANTHROPIC_API_KEY` | `None` | `SecretStr`.  Required only for `claude-*` / `anthropic/...` models. |
+| `OPENROUTER_API_KEY` | `None` | `SecretStr`.  Required only for `openrouter/<vendor>/<model>`. |
+| `OPENAI_BASE_URL` | `None` | OpenAI-compatible endpoint override.  Applies to OpenAI models only; ignored with a warning otherwise. |
+| `LLM_TIMEOUT_S` | `45.0` (`> 0`) | Per-attempt provider timeout. |
+| `LLM_MAX_RETRIES` | `2` (`0..5`) | LiteLLM retries on transient provider errors. |
+| `DATABASE_PATH` | `leads.db` | SQLite file; used when `DATABASE_URL` is unset. |
+| `DATABASE_URL` | `None` | `SecretStr` PostgreSQL DSN.  When set it replaces SQLite (see D-08). |
+| `MAX_CONCURRENT_SCRAPES` | `3` | Bound of the `asyncio.Semaphore` shared by CLI and API. |
 | `PAGE_TIMEOUT_MS` | `20000` | Playwright navigation timeout; also the scraper's anti-hang guard. |
-| `LOG_LEVEL` | `INFO` | Standard library logging level applied at process startup. |
+| `LOG_LEVEL` | `INFO` | Root logging level (`configure_logging` for the API, the Rich handler for the CLI). |
 
-### OpenRouter / Custom Endpoint Support
+**Migration note.**  `Settings` uses `extra="ignore"`, so a v1 `.env` that
+still sets `OPENAI_MODEL` is silently ignored and the default model is used.
+Rename it to `LLM_MODEL`.
 
-`OPENAI_BASE_URL` is forwarded to `AsyncOpenAI` only when it is not `None`:
+**Slot-hold bound.**  One LLM call can occupy a concurrency slot (and its
+browser) for at most `(LLM_MAX_RETRIES + 1) * LLM_TIMEOUT_S`, which is 135 s
+with the defaults.  LiteLLM's own default timeout is 6000 s, which is why the
+explicit 45 s value exists.
 
-```python
-**({"base_url": self._settings.OPENAI_BASE_URL} if self._settings.OPENAI_BASE_URL else {})
-```
+### Repository selection — `get_repository()`
 
-Passing `base_url=None` explicitly to the SDK would override its internal
-default with `None`, causing a runtime error.  The conditional unpacking
-avoids this without special-casing the `AsyncOpenAI` constructor.  Any
-OpenAI-compatible endpoint (OpenRouter, Azure OpenAI proxy, LM Studio) is
-supported without code changes by setting `OPENAI_BASE_URL` in `.env`.
+`get_repository(settings)` returns a `PostgresLeadRepository` when
+`DATABASE_URL` is set and a SQLite `LeadRepository` otherwise.  A
+`DATABASE_URL` that does not start with `postgresql://` or `postgres://`
+raises `ValueError`: falling back to SQLite would silently write to the wrong
+store.  The storage imports are deferred into the function because the storage
+modules import `src.llm`, which imports `src.config`; a top-level import would
+be circular.  The caller owns the lifecycle (`init_db()` first, `close()`
+last).
 
 ---
 
@@ -58,7 +72,7 @@ supported without code changes by setting `OPENAI_BASE_URL` in `.env`.
 
 | File | Responsibility |
 |---|---|
-| `browser.py` | Chromium lifecycle, route interception, context management. |
+| `browser.py` | Chromium lifecycle, request filter, destination policy, CDP redirect guard. |
 | `fetcher.py` | Page navigation, wait strategy, error mapping, DOM extraction. |
 | `cleaner.py` | HTML → Markdown normalisation via trafilatura, token-budget enforcement. |
 
@@ -66,22 +80,58 @@ supported without code changes by setting `OPENAI_BASE_URL` in `.env`.
 
 `BrowserManager` is an `async with`-compatible context manager that owns
 exactly one Playwright instance, one Chromium browser, and one browser context.
-It follows a strict dependency-ordered teardown sequence in `__aexit__`:
-`context.browser.close()` → `playwright.stop()`, with independent try/finally
-blocks to guarantee the Playwright driver process is always terminated even if
-the browser close raises.
+Teardown (`_teardown`) closes the browser (which also closes its contexts and
+pages) and then stops the Playwright driver, in independent try/finally blocks
+so the driver subprocess, the process that would otherwise outlive us, is
+always stopped even if the browser close raises or is cancelled.  The same
+routine runs when `__aenter__` fails midway (it catches `BaseException`),
+because `__aexit__` never runs for a failed `__aenter__`.
 
-**Route interception** is registered at the context level (not per-page):
+**Request filtering** is registered at the context level (not per-page):
 
 ```python
-await self._context.route("**/*", _abort_blocked_resources)
+await self._context.route("**/*", _RequestFilter(self._policy))
 ```
 
-`_abort_blocked_resources` calls `route.abort()` for `image`, `media`, `font`,
-and `stylesheet` resource types; all other requests pass through via
-`route.continue_()`.  Context-level registration means every page opened inside
-the context inherits the filter automatically — no per-page setup is required
-and no resource can slip through if a page is opened by JavaScript.
+`_RequestFilter` is a callable class with three outcomes per request:
+
+| Request | Outcome |
+|---|---|
+| `image`, `media`, `font`, `stylesheet` | `route.abort()`; the guard is not consulted. |
+| Destination allowed by `_DestinationPolicy` | `route.continue_()`. |
+| Destination denied | `route.abort("blockedbyclient")`. |
+
+Context-level registration means every page opened inside the context
+inherits the filter automatically.  Unsafe requests are *aborted*, never
+fulfilled, so the page sees a network error rather than attacker-shaped
+content.
+
+**`_DestinationPolicy`** wraps an injectable `UrlGuard` (default
+`assert_public_destination` from `src/core/url_safety.py`).  Verdicts are
+cached per `scheme://host:port` for the lifetime of the context, so a page
+issuing hundreds of same-origin requests costs one DNS lookup.  `data:`,
+`blob:` and `about:` URLs bypass the guard because they have no host.  The
+policy **fails closed**: an `UnsafeUrlError` and an unexpected guard crash
+both deny the request (the crash is logged with `logger.exception`).
+
+**Redirect interception.**  Playwright's route handler does not see redirect
+hops: Chromium follows a 3xx internally and Playwright reports it only
+afterwards as a passive `request` event.  `BrowserManager.new_page()` is the
+only way to obtain a page, and it attaches a `_RedirectGuard` before the
+caller can navigate.  The guard opens a CDP session and enables
+`Fetch.enable` with a `Response`-stage pattern.  For every paused response:
+
+- a 3xx with a `Location` header: the header is resolved against the request
+  URL (`urljoin`) and vetted through the shared `_DestinationPolicy`; a denied
+  target gets `Fetch.failRequest(BlockedByClient)`, otherwise
+  `Fetch.continueResponse`;
+- anything else: `Fetch.continueResponse` without a lookup;
+- any internal error: `Fetch.failRequest`, because a paused request that is
+  never answered would hang the navigation.  If even that fails (target
+  already gone) it is logged at DEBUG.
+
+Handler tasks are held in a set because the event loop keeps only weak
+references to tasks.  See D-09 for the rationale and the residual limits.
 
 `route.abort()` is used instead of returning an empty response because aborting
 keeps the browser's internal request queue clean.  Empty responses can trigger
@@ -120,6 +170,13 @@ fires reliably without timing out.
 crashes that occur after a successful navigation.  `page.close()` is in a
 `finally` block so page handles are freed immediately regardless of outcome.
 
+Playwright's own messages name the exact address and network error, so they go
+only into `ScrapeError.reason` (logs).  `public_reason`, which is the only text
+persisted and served, is one of a few fixed strings: the navigation timeout,
+`"URL blocked: destination is not a public address"` (when the message contains
+`ERR_BLOCKED_BY_CLIENT`), `"Page could not be loaded"`, or
+`"Page content could not be read"`.  See D-10.
+
 ### 2.3 `cleaner.py` — HTML → Markdown Normalisation
 
 `extract_markdown` delegates DOM boilerplate removal to trafilatura, which uses
@@ -151,9 +208,9 @@ the LLM rather than implying the page content ended abruptly.
 
 | File | Responsibility |
 |---|---|
-| `schemas.py` | Pydantic v2 DTOs that double as OpenAI Structured Outputs contracts. |
+| `schemas.py` | Pydantic v2 DTOs that double as the structured-output `response_format` contract. |
 | `prompts.py` | Versioned, deterministic system and user prompt templates. |
-| `client.py` | Thin async OpenAI client wrapper; maps all API errors to `LLMExtractionError`. |
+| `client.py` | Provider-agnostic async LiteLLM wrapper; maps every provider and validation error to `LLMExtractionError`. |
 
 ### 3.1 `schemas.py` — Pydantic v2 DTOs
 
@@ -196,9 +253,9 @@ of `Tier 1 (High)`, `Tier 2 (Medium)`, `Tier 3 (Low)`, and `Disqualified`,
 which the JSON schema publishes as an enum.  `fit_score` is an `int` with
 `ge=0` and `le=100`, published as `minimum` / `maximum`.
 
-All `Field(description=...)` strings are deliberately verbose because the
-OpenAI SDK serialises them into the JSON schema injected into the model's system
-context.  The field descriptions are therefore functional — they constrain the
+All `Field(description=...)` strings are deliberately verbose because LiteLLM
+serialises them into the JSON schema sent to the provider as the response
+format.  The field descriptions are therefore functional — they constrain the
 model's extraction behaviour, not just document the Python type.
 
 `LeadScoring.fit_score` carries `ge=0, le=100` constraints that are reflected
@@ -277,28 +334,67 @@ edit and the tests move together.  See D-06.
 context boundary is unambiguous.  The Markdown argument is the Trafilatura
 output, already truncated to the scraper character budget.
 
-### 3.3 `client.py` — OpenAI Structured Outputs Client
+### 3.3 `client.py` — LiteLLM Structured Outputs Client
 
-`LLMClient` uses `client.beta.chat.completions.parse` exclusively — the
-OpenAI SDK method that validates the model response against a Pydantic model
-before returning.  The entire class contains zero calls to `json.loads()`,
-`json.dumps()`, or dict-to-model coercion.
+`LLMClient` routes every call through `litellm.acompletion` with
+`response_format=EnrichedLeadPayload` and validates the returned content with
+`EnrichedLeadPayload.model_validate_json`.  The module contains no
+`json.loads()` and no dict-to-model coercion (architectural invariant 3).  See
+D-07 for why the OpenAI-only `.parse` call was replaced.
 
-**Why Structured Outputs over raw JSON parsing**:
+**Provider and key resolution.**  `_resolve_provider(LLM_MODEL)` is an
+allowlist, not a default:
 
-| Approach | Risk |
+| `LLM_MODEL` shape | Provider | Key setting |
+|---|---|---|
+| `gpt-*`, `chatgpt-*`, `ft:gpt-*`, `o1*`, `o3*`, `o4*`, or `openai/<model>` | `openai` | `OPENAI_API_KEY` |
+| `claude*` or `anthropic/<model>` | `anthropic` | `ANTHROPIC_API_KEY` |
+| `openrouter/<vendor>/<model>` | `openrouter` | `OPENROUTER_API_KEY` |
+| anything else (`gemini/...`, `azure/...`, ...) | rejected with `ValueError` | n/a |
+
+`LLMClient.__init__` resolves the key and raises `ValueError` if the one it
+needs is unset, so a misconfiguration fails at startup rather than once per
+lead.  Keys are passed to LiteLLM explicitly because values loaded from `.env`
+by pydantic-settings are not exported to `os.environ`, where LiteLLM would
+otherwise look.
+
+**Call parameters.**  `timeout=LLM_TIMEOUT_S`, `num_retries=LLM_MAX_RETRIES`,
+`temperature=0.1`, and `api_base` only when `OPENAI_BASE_URL` is set *and* the
+model is an OpenAI model.  With any other provider the override is dropped and
+a warning is logged, so a proxy URL can never receive another vendor's key.
+There is **no fallback routing**: no `litellm.Router`, no `fallbacks`.
+Resilience is retries on the one configured model.
+
+**Module-level LiteLLM hardening.**
+
+- `LITELLM_LOCAL_MODEL_COST_MAP=True` is set via `os.environ.setdefault`
+  *before* `import litellm`.  By default LiteLLM downloads its cost map from
+  GitHub at import, which would open a socket (tripping the offline test guard)
+  and add a startup network dependency in production.
+- `litellm.telemetry = False`.
+- `litellm.drop_params = True` discards request parameters a provider does not
+  support (for example `temperature` on reasoning models) instead of failing.
+- The `LiteLLM*`, `httpx`, `httpcore` and `openai` loggers are pinned to
+  `WARNING`, so `LOG_LEVEL=DEBUG` for the application never dumps provider
+  traffic and headers.
+
+**Error mapping.**  LiteLLM maps every provider failure (auth, rate limit,
+context window, timeout, connection, content policy) onto subclasses of
+`openai.OpenAIError`; one `except` clause therefore covers all providers.  The
+`openai` package stays a dependency for that exception hierarchy only.  Three
+failure paths raise `LLMExtractionError`, each with a fixed `public_reason`:
+
+| Cause | `public_reason` |
 |---|---|
-| `json.loads()` on raw model output | Model may emit malformed JSON, trailing commas, code fences, or extra prose; requires defensive parsing and schema re-validation. |
-| `response_format={"type": "json_object"}` | Schema is not enforced; model selects field names and types freely; requires a separate Pydantic parse step. |
-| `client.beta.chat.completions.parse` with `EnrichedLeadPayload` | Schema is injected into the API call; the SDK validates and constructs the Pydantic model atomically; `parsed` is `None` only on content-filter refusals. |
+| `openai.OpenAIError` from LiteLLM | `"LLM provider request failed (<ExceptionType>)"` |
+| Empty `message.content` (possible refusal) | `"LLM returned an empty response"` |
+| `pydantic.ValidationError` on the content | `"LLM response did not match the expected schema"` |
 
-Temperature is set to `0.1` (not `0.0`) to preserve variety in free-text
-fields (`scoring_rationale`, `icebreaker`) while keeping numeric fields
-(`fit_score`) near-deterministic.
+The full provider or validation text goes to `reason` and the error log only.
 
-All `openai.APIError` subclasses (auth, rate-limit, network, content-filter)
-are caught and re-raised as `LLMExtractionError`, insulating the orchestration
-layer from the OpenAI SDK's exception hierarchy.
+Temperature is `0.1` (not `0.0`) to preserve variety in free-text fields
+(`scoring_rationale`, `icebreaker`) while keeping `fit_score` near
+deterministic.
 
 ---
 
@@ -308,10 +404,16 @@ layer from the OpenAI SDK's exception hierarchy.
 
 | File | Responsibility |
 |---|---|
-| `database.py` | Schema DDL, idempotent `init_db`, `get_db_connection` context manager. |
-| `repository.py` | CRUD operations against the `leads` table; the only SQL-issuing module. |
+| `base.py` | `BaseLeadRepository` ABC: the only storage surface the service, CLI and API depend on. |
+| `database.py` | SQLite schema DDL, idempotent `init_db`, `get_db_connection` context manager. |
+| `repository.py` | SQLite driver (`LeadRepository`). |
+| `postgres.py` | PostgreSQL driver (`PostgresLeadRepository`) on an `asyncpg` pool. |
 
-### 4.1 `database.py` — Schema & Connection Management
+Each driver owns its SQL and dialect differences; no other module issues SQL.
+The backend is chosen by `get_repository()` (§1).  The SQL in 4.1 and 4.2 is
+the SQLite driver; 4.3 and 4.4 cover the contract and the PostgreSQL driver.
+
+### 4.1 `database.py` — SQLite Schema & Connection Management
 
 **Schema** (`leads` table):
 
@@ -337,7 +439,7 @@ full-table scans on both the most common analytical query patterns.
 immediately after opening.  `aiosqlite.Row` supports dict-style access and
 `dict()` conversion, keeping callers free of `aiosqlite` internals.
 
-### 4.2 `repository.py` — CRUD & Status Lifecycle
+### 4.2 `repository.py` — SQLite CRUD & Status Lifecycle
 
 **`insert_pending_lead`** uses `INSERT OR IGNORE` to safely handle concurrent
 pipeline tasks that race to insert the same URL.  The subsequent `SELECT id`
@@ -356,13 +458,17 @@ overwrite any existing `enriched_data`) and to a `SELECT` + conditional
     │
     ├─── scrape & enrich succeed ──► PROCESSED  ← save_lead_success()
     │
-    └─── ScrapeError / LLMExtractionError ──► FAILED  ← mark_lead_failed()
+    ├─── ScrapeError / LLMExtractionError / unexpected error ──► FAILED  ← mark_lead_failed()
+    │
+    └─── re-submission (FAILED, or PROCESSED with force) ──► PENDING  ← reset_to_pending()
 ```
 
-`mark_lead_failed` is explicitly designed to never raise; any exception during
-failure-state persistence would shadow the original pipeline error, losing the
-root-cause context.  The method logs at `WARNING` level and returns silently on
-any internal error.
+`mark_lead_failed` lets database errors propagate; the driver does not
+swallow them.  Protection against masking the original pipeline error lives
+one level up: `EnrichmentService._record_failure` wraps the call, logs with
+`logger.exception`, and returns (§5.1).  (An earlier revision of this document
+claimed the repository method itself never raises; that did not match the
+code.)  The driver logs the transition at `WARNING`.
 
 Each repository method opens its own connection via `get_db_connection`.  This
 avoids shared-connection lock contention in concurrent pipelines and ensures
@@ -372,70 +478,202 @@ explicitly before the context exits.
 
 ---
 
-## 5. `src/main.py` — CLI Orchestrator
+### 4.3 `base.py` — `BaseLeadRepository` contract
 
-### Execution Model
+| Method | Contract |
+|---|---|
+| `init_db()` | Idempotent; awaited once before any other call.  Creates the schema (and, for Postgres, the pool). |
+| `close()` | Releases what `init_db` acquired.  Non-abstract no-op, inherited by SQLite (no held resources). |
+| `get_lead_by_url(url)` | Full row (including `raw_markdown`) or `None`; used by the idempotency check. |
+| `get_lead_by_id(lead_id)` | API-facing row: every column except `raw_markdown`, which is too large for responses. |
+| `list_leads(skip, limit, fit_tier, status)` | `(rows, total)`, newest first (`ORDER BY id DESC`); exact-match filters; `total` ignores paging. |
+| `ping()` | `True` when reachable; connectivity failures propagate so callers can log the cause. |
+| `insert_pending_lead(url, domain)` | Creates a `PENDING` row or returns the existing ID; safe under concurrent calls (D-03). |
+| `reset_to_pending(lead_id)` | Sets `PENDING` and clears `error_message`; keeps old `enriched_data` until the re-run overwrites it. |
+| `save_lead_success(lead_id, payload, raw_markdown)` | Persists the validated `EnrichedLeadPayload` and sets `PROCESSED`. |
+| `mark_lead_failed(lead_id, error_message)` | Sets `FAILED` and records the sanitised message. |
+| `get_leads_by_urls(urls)` | Summary rows for a CLI batch, `fit_score` descending, unscored rows last. |
 
-The pipeline for each URL executes five sequential stages inside
-`_process_url`:
+### 4.4 `postgres.py` — PostgreSQL driver
 
-1. **Idempotency check** (`LeadRepository.get_lead_by_url`) — runs *before*
-   semaphore acquisition so that already-processed URLs consume zero
-   concurrency slots.
-2. **`insert_pending_lead`** — establishes the `lead_id` used by all
-   subsequent stages.  Idempotent via `INSERT OR IGNORE`.
-3. **`fetch_page_markdown`** — headless browser → trafilatura → clean Markdown.
-4. **`LLMClient.enrich_lead`** — Markdown → validated `EnrichedLeadPayload`.
-5. **`LeadRepository.save_lead_success`** — persist structured payload.
+`PostgresLeadRepository(dsn, min_size=1, max_size=10)` shares one
+`asyncpg.Pool` across all coroutines.  The pool is created lazily in
+`init_db()` and released in `close()`; any call before `init_db()` raises
+`RuntimeError`.
 
-On `ScrapeError` or `LLMExtractionError`: `mark_lead_failed` is called (best-
-effort, wrapped in the same except block) and the pipeline returns `"failed"`
-without re-raising.  `asyncio.gather` therefore always collects all results;
-one failing URL does not cancel sibling tasks.
+The DDL mirrors the SQLite schema with native types: `id BIGINT GENERATED
+ALWAYS AS IDENTITY`, `enriched_data JSONB`, `created_at` / `updated_at`
+`TIMESTAMPTZ NOT NULL DEFAULT now()`, the same `status` CHECK constraint, and
+the same two indexes.  `init_db()` executes the multi-statement DDL in one
+call (permitted because no parameters are bound).
 
-### Concurrency Model
+Dialect differences from the SQLite driver:
 
-```python
-semaphore = asyncio.Semaphore(settings.MAX_CONCURRENT_SCRAPES)
-tasks = [asyncio.create_task(_process_url(url, ..., semaphore=semaphore)) for url in urls]
-results = await asyncio.gather(*tasks)
-```
+| Concern | SQLite | PostgreSQL |
+|---|---|---|
+| Insert-if-absent | `INSERT OR IGNORE` + `SELECT id` | `INSERT ... ON CONFLICT (url) DO NOTHING RETURNING id`, then `SELECT id` when `RETURNING` yields nothing |
+| Parameters | `?` | `$1 ... $n` |
+| JSON column | `JSON` (text) | `JSONB`; written as `$n::jsonb` from `payload.model_dump_json()` |
+| Batch lookup | chunked `IN (...)` (500 per statement) | `url = ANY($1::text[])`, `ORDER BY fit_score DESC NULLS LAST` |
+| Connections | one per call | pooled |
 
-All tasks are created immediately (fan-out), but each acquires `semaphore`
-before launching Playwright.  This means:
-- At most `MAX_CONCURRENT_SCRAPES` browser contexts are live simultaneously.
-- At most `MAX_CONCURRENT_SCRAPES` concurrent OpenAI requests are in flight.
-- URLs whose semaphore wait is long (due to slow scrapers ahead) benefit from
-  the idempotency check pre-empting the wait for already-processed URLs.
+Interpolated SQL is limited to fixed fragments (the column list, `WHERE`
+clauses built from a fixed set, placeholder numbers); every value is bound.
 
-### Error Handling Philosophy
-
-The orchestrator uses a `Literal["processed", "skipped", "failed"]` return
-type rather than bubbling exceptions out of `_process_url`.  This enforces
-that a per-URL failure is a *handled* outcome, not an unhandled exception.
-The `--force` flag bypasses the `PROCESSED` skip guard and re-runs the full
-pipeline against all supplied URLs regardless of prior state.
+**Test status.**  The offline suite exercises the API and service against the
+SQLite driver; **no offline test targets `PostgresLeadRepository`**, because
+the suite forbids sockets.  The Postgres path is verified by running the
+Docker Compose stack.  A containerised integration test is the natural next
+step and is listed in §9.
 
 ---
 
-## 6. `src/core/exceptions.py` — Exception Hierarchy
+## 5. Service Layer & Entry Points
+
+Both entry points drive the same `EnrichmentService`, so CLI and API have
+identical semantics.  See D-12.
+
+### 5.1 `src/services/enrichment.py` — `EnrichmentService`
+
+The pipeline is split into two steps so the API can answer before the work
+finishes:
+
+1. **`submit(url, force=False)`** runs *before* the semaphore is taken, so
+   already-processed URLs consume no concurrency slot.  It calls
+   `get_lead_by_url`; if the row is `PROCESSED` and `force` is false it
+   returns `Submission(needs_processing=False)`.  Otherwise it calls
+   `insert_pending_lead` and, when a row already existed, `reset_to_pending`,
+   so a `FAILED` or forced lead does not keep reporting its old outcome to
+   pollers while the re-run is in flight.
+2. **`process_lead(lead_id, url)`** guards on an in-process `_in_flight` set
+   (a repeated request for the same lead returns `"skipped"` instead of
+   starting a second pipeline), then runs `scrape -> LLM -> persist` under
+   `async with semaphore`.
+
+`process_lead` never raises for pipeline failures, because in a background
+task nobody awaits the result and an escaped exception would leave the lead
+`PENDING` forever:
+
+| Exception | Stored `error_message` | Logged |
+|---|---|---|
+| `ScrapeError`, `LLMExtractionError` | `exc.public_reason` | `logger.error` with the full text |
+| any other `Exception` | `"Unexpected error: <ExceptionType>"` | `logger.exception` (full traceback) |
+
+Failure recording goes through `_record_failure`, which logs and swallows its
+own errors so persistence trouble never masks the original failure.
+`enrich_url` (`submit` then `process_lead`) is the CLI's per-URL entry point.
+The scraper is injected (`Scraper = Callable[[str, int], Awaitable[str]]`) so
+tests never open a browser.
+
+**Concurrency.**  One `asyncio.Semaphore(MAX_CONCURRENT_SCRAPES)` bounds live
+browser contexts and simultaneous LLM calls across all in-flight leads.
+`_in_flight` is per-process state.
+
+### 5.2 `src/api/` — REST API
+
+| File | Responsibility |
+|---|---|
+| `app.py` | `create_app(settings, *, llm_client, scraper)` factory and lifespan; module-level `app = create_app()`; `API_VERSION = "2.0.0"`. |
+| `routes.py` | Thin adapters over `EnrichmentService` and the repository. |
+| `schemas.py` | Request and response DTOs. |
+| `security.py` | Re-exports `src.core.url_safety`; the scraper may not import from the API layer. |
+
+**Lifespan.**  Configure logging, build the repository via
+`get_repository`, `await repo.init_db()`, construct the `EnrichmentService`
+and store `repo` and `service` on `app.state`; on shutdown `await
+repo.close()`.  `create_app` accepts an injected `LLMClient` and scraper so
+tests need no provider key and no browser.
+
+**Endpoints.**
+
+| Method and path | Success | Errors |
+|---|---|---|
+| `POST /api/v1/enrich` | `202` `EnrichResponse` (queued); `200` when the URL is already `PROCESSED` and `force` is false | `422` unsafe or malformed URL |
+| `GET /api/v1/leads/{lead_id}` | `200` `LeadResponse` | `404` unknown id |
+| `GET /api/v1/leads` | `200` `LeadListResponse`; query `page` (>= 1), `page_size` (1..100, default 50), `fit_tier`, `status` | `422` invalid query |
+| `GET /health` | `200` `{"status":"healthy","database":"ok"}` | `503` `{"status":"unhealthy","database":"unreachable"}` |
+
+FastAPI also serves `/docs` and `/openapi.json`.
+
+**The 200/202 contract.**  `POST /enrich` validates, calls `submit`, and either
+answers `200` immediately (nothing to do) or registers
+`service.process_lead` with FastAPI `BackgroundTasks` and answers `202`.  The
+client polls `GET /api/v1/leads/{lead_id}` until `status` is `PROCESSED` or
+`FAILED`.
+
+**URL validation order.**  `EnrichRequest.url` runs `validate_url_syntax` in a
+Pydantic field validator (no I/O); the route then runs `assert_public_host`
+(DNS) and maps `UnsafeUrlError` to `422`.  `url` stays a plain `str` rather
+than `HttpUrl` because `HttpUrl` would rewrite `https://linear.app` to
+`https://linear.app/` and fork the identity key shared with the CLI.
+
+**Response DTOs.**  `LeadResponse` parses stored `enriched_data` text into a
+dict with a `TypeAdapter(dict[str, Any]).validate_json` (no hand-rolled
+`json.loads`), because both drivers return JSON text.  `LeadStatus` and
+`FitTier` are `Literal` aliases.
+
+**Health.**  A failing `ping()` is logged with `logger.exception` and reported
+as `503`, never surfaced as a `500`.
+
+**Known limits.**  The API has **no authentication**; Docker Compose binds it
+to loopback and assumes an upstream gateway or reverse proxy for any wider
+exposure.  Background tasks run in the API process, so a restart mid-job
+leaves that lead `PENDING`; there is no recovery sweep, and re-submitting the
+URL re-queues it.  `_in_flight` and the semaphore are per-process, so running
+several API workers multiplies the effective concurrency.
+
+### 5.3 `src/main.py` — CLI
+
+`main()` parses arguments, builds the repository, awaits `init_db()`, and runs
+`_run`, which creates one `EnrichmentService` and fans out
+`asyncio.create_task(service.enrich_url(url, force=force))` for every URL.
+`asyncio.gather` always collects all results, because a per-URL failure is a
+*handled* outcome (`Literal["processed", "skipped", "failed"]`), not an
+exception.  `repo.close()` runs in a `finally`.  `--force` bypasses the
+`PROCESSED` skip.
+
+Presentation is Rich only: logs go to stderr through `RichHandler`; the run
+summary panel and the per-URL results table (from `get_leads_by_urls`, ordered
+by score, tier-coloured) go to stdout so output can be piped.
+
+---
+
+## 6. `src/core/` — Exceptions and URL Safety
+
+### 6.1 `exceptions.py` — Exception hierarchy
 
 ```
-LeadEnrichmentError (base)
-├── ScrapeError(url, reason)          — Playwright failures
-├── LLMExtractionError(url, reason)   — OpenAI API errors, schema validation failures
-└── StorageError                      — Unrecoverable persistence failures
+LeadEnrichmentError (base; public_reason = "Enrichment failed")
+├── ScrapeError(url, reason, *, public_reason="Page could not be retrieved")
+├── LLMExtractionError(url, reason, *, public_reason="LLM enrichment failed")
+└── StorageError
 ```
 
-Both `ScrapeError` and `LLMExtractionError` carry `url` and `reason`
-attributes with identical signatures.  This symmetry is intentional: the
-orchestrator's `except (ScrapeError, LLMExtractionError)` block handles both
-through the same `str(exc)` → `mark_lead_failed` path, without needing to
-inspect the error type at the call site.
+`reason` is the full diagnostic for server-side logs and may contain driver or
+vendor detail.  `public_reason` is the fixed, caller-safe summary persisted on
+the lead and served by the API.  The two classes carry identical attributes,
+so the service handles both through one `except (ScrapeError,
+LLMExtractionError)` and stores `exc.public_reason` without inspecting the
+type.  Locating exceptions in `src/core/` avoids the circular imports that
+would arise if, for example, `scraper` imported from `llm` to raise a common
+type.  `StorageError` is defined but nothing raises it today.
 
-Locating exceptions in `src/core/` breaks the circular-import risk that would
-arise if, for example, `scraper` imported from `llm` just to raise a common
-error type.
+### 6.2 `url_safety.py` — SSRF primitives
+
+The scraper drives a real browser at whatever URL it is given, so an untrusted
+caller could otherwise aim it at loopback services, the cloud metadata
+endpoint (`169.254.169.254`) or the internal network.  The module is in
+`core` because both the API and the scraper enforce the same policy.
+
+| Function | Role |
+|---|---|
+| `validate_url_syntax(url)` | Pure, no I/O.  Rejects empty or over-2048-character URLs, whitespace, control characters and backslashes (browsers treat `\` as `/`, so `http://127.0.0.1\@example.com` would otherwise pass), malformed ports, non-http(s) schemes, blocked hostnames (`localhost`, `*.local`, `*.internal`, `*.localhost`, `*.localdomain`, `*.home.arpa`) and non-public IP literals. |
+| `assert_public_host(url, resolver)` | Resolves non-literal hostnames (5 s timeout) and rejects the URL if **any** resolved address is non-public, because the browser may pick any of them.  Catches obfuscated forms such as `2130706433` or `0x7f.1`, which only reveal their target once resolved. |
+| `assert_public_destination(url, resolver)` | One browser request: scheme, hostname checks and resolved addresses.  Does not cap length or reject odd characters, since sub-resource URLs are legitimately long and Chromium has already normalised them. |
+
+`_is_public_ip` uses `ip.is_global and not ip.is_multicast` and unwraps
+IPv4-mapped IPv6 (`::ffff:127.0.0.1`) before judging.  The resolver is an
+injectable `HostResolver`, so tests never touch DNS.  See D-09.
 
 ---
 
@@ -455,6 +693,12 @@ event fires, making the signal reliable without sacrificing content fidelity.
 
 ### D-02: OpenAI Structured Outputs over raw JSON parsing
 
+> **Status: superseded by D-07 (v2.0).**  The principle stands (schema-constrained
+> output, no `json.loads`, Pydantic as the only parser).  The mechanism changed:
+> `client.beta.chat.completions.parse` is gone, replaced by LiteLLM with
+> `response_format=EnrichedLeadPayload` and `model_validate_json`.  The text
+> below is kept as the v1 record.
+
 **Decision**: Use `client.beta.chat.completions.parse` with
 `response_format=EnrichedLeadPayload`.
 
@@ -468,6 +712,11 @@ a distinct, handleable condition.
 
 ### D-03: `INSERT OR IGNORE` + subsequent `SELECT` for idempotency
 
+> **Amended in v2.0 (D-08):** the PostgreSQL driver applies the same pattern in
+> its own dialect: `INSERT ... ON CONFLICT (url) DO NOTHING RETURNING id`, then
+> `SELECT id` when `RETURNING` yields nothing.  The invariant (a `UNIQUE` `url`
+> plus insert-if-absent plus read-back, never select-then-insert) is unchanged.
+
 **Decision**: Use `INSERT OR IGNORE` followed by `SELECT id` rather than an
 upsert or select-then-insert pattern.
 
@@ -478,6 +727,10 @@ inserts; the follow-up `SELECT` retrieves the winner's PK regardless of which
 coroutine's insert actually landed.
 
 ### D-04: Per-method connection opening in `LeadRepository`
+
+> **Scope narrowed in v2.0 (D-08):** this applies to the **SQLite** driver only.
+> `PostgresLeadRepository` shares one `asyncpg` pool (1 to 10 connections), which
+> gives the same freedom from a shared-connection lock without a connect per call.
 
 **Decision**: Each repository method opens its own `aiosqlite` connection
 rather than holding a long-lived connection on the `LeadRepository` instance.
@@ -506,12 +759,14 @@ making the database directly queryable by standard SQL tooling.
 v2.0 ICP tier bands with an offline pytest suite
 (`tests/test_scoring_regression.py`, `tests/test_schemas.py`,
 `tests/fixtures/eval/`).  Golden labels are plain dictionaries validated by
-`EnrichedLeadPayload.model_validate` — the same Pydantic contract the OpenAI
-parse path enforces, exercised on a local dict.  An autouse
-fixture replaces `socket.create_connection` so a TCP connect fails the run.
-CI (`.github/workflows/ci.yml`) installs `ruff`, `pytest`, and
-`pytest-asyncio`, runs `ruff check src/`, then `pytest tests/ -v`, and exports
-a mock `OPENAI_API_KEY` that this suite never reads.
+`EnrichedLeadPayload.model_validate` — the same Pydantic contract the
+production LLM path enforces (`model_validate_json`), exercised on a local
+dict.  Autouse fixtures replace `socket.create_connection` (in the module) and,
+suite-wide in `tests/conftest.py`, `socket.create_connection`,
+`socket.socket.connect` and `socket.getaddrinfo`, so a connect or DNS lookup
+fails the run.  CI (`.github/workflows/ci.yml`) installs with `uv sync --dev`,
+runs `ruff check src/`, then `pytest tests/ -v`, and exports a mock
+`OPENAI_API_KEY` that the suite never uses to reach a provider.
 
 **Rationale**: Structured Outputs make a live response schema-shaped, and
 temperature `0.1` still leaves `scoring_rationale` and `icebreaker` free to
@@ -565,6 +820,189 @@ still move a real score until the next live run.
 
 ---
 
+### D-07: LiteLLM as the provider-agnostic LLM layer
+
+**Decision**: Replace the OpenAI-only `client.beta.chat.completions.parse` call
+with `litellm.acompletion(..., response_format=EnrichedLeadPayload)`, validate
+the returned content with `EnrichedLeadPayload.model_validate_json`, and select
+the provider with a single `LLM_MODEL` setting.  Supersedes D-02's mechanism.
+
+**Rationale**: The ICP scoring contract is vendor-neutral; the client was not.
+LiteLLM gives one call shape across OpenAI, Anthropic and OpenRouter, so
+changing provider is configuration, not code.  The invariant behind D-02
+survives: output is schema-constrained at the provider and parsed exactly once,
+by Pydantic.  Hardening choices that came with the migration:
+
+1. **Allowlist, not default.**  LiteLLM will route `gemini/...` or `azure/...`
+   to that vendor.  The only credential this application could attach would be
+   the OpenAI one, so unsupported prefixes are rejected at construction
+   instead of defaulted to OpenAI.
+2. **Fail fast on keys.**  The key required by `LLM_MODEL` is checked in
+   `LLMClient.__init__`; a missing key surfaces at startup, not once per lead.
+   Keys are passed explicitly because `.env` values are not in `os.environ`.
+3. **Bounded waits.**  `LLM_TIMEOUT_S` (45) and `LLM_MAX_RETRIES` (2) cap a
+   call at 135 s of slot time; LiteLLM's own default timeout is 6000 s.
+4. **No startup network dependency.**  `LITELLM_LOCAL_MODEL_COST_MAP=True` is
+   set before the import, so LiteLLM never fetches its cost map from GitHub.
+   This also keeps the offline test guard intact.
+5. **Quiet and portable.**  Telemetry off; `drop_params=True` for providers
+   that reject `temperature`; provider and HTTP loggers pinned to `WARNING`.
+6. **Base URL cannot leak a key.**  `OPENAI_BASE_URL` applies to OpenAI models
+   only; with other providers it is ignored with a warning.
+
+**Tradeoffs**: Retry-only resilience; there is **no fallback routing** (no
+`litellm.Router`), so a provider outage fails the lead (recorded `FAILED`, safe
+to re-submit).  Structured-output support varies by model, and `drop_params`
+can hide an unsupported parameter, so a new model should be checked with a live
+run.  The `openai` package remains a dependency solely for the exception
+hierarchy LiteLLM maps onto.
+
+### D-08: PostgreSQL alongside SQLite behind one repository contract
+
+**Decision**: Introduce `BaseLeadRepository` (`src/storage/base.py`) and a
+second driver, `PostgresLeadRepository` on an `asyncpg` pool.  `DATABASE_URL`
+selects PostgreSQL; otherwise SQLite on `DATABASE_PATH` is used.
+
+**Rationale**: SQLite keeps the CLI zero-setup, but a concurrent HTTP API and a
+multi-container deployment need a server database.  An ABC lets the service,
+CLI and API stay unchanged; each driver owns its SQL.  The two schemas are
+deliberately parallel (same columns, constraint and indexes), with native
+types on Postgres (`JSONB`, `TIMESTAMPTZ`, `BIGINT IDENTITY`).  Idempotency
+(D-03) is re-expressed as `ON CONFLICT DO NOTHING RETURNING`.  `init_db()` is
+idempotent and also builds the pool, and `close()` releases it.  A non-Postgres
+`DATABASE_URL` raises instead of falling back to SQLite, so a typo cannot
+silently redirect writes to a local file.  The DSN is a `SecretStr`.
+
+**Tradeoffs**: Two drivers to keep in step (any new contract method must be
+implemented twice).  No schema migration tool: `CREATE ... IF NOT EXISTS` only,
+so column changes need a manual migration.  **The Postgres driver has no
+offline test**, because the suite forbids sockets; it is exercised through the
+Docker Compose stack.
+
+### D-09: Two-layer SSRF guard, including CDP redirect interception
+
+**Decision**: Enforce one URL policy (`src/core/url_safety.py`) at two points:
+the API front door (syntax in a Pydantic validator, then DNS resolution in the
+route) and, inside the scraper, on every browser request.  Redirect hops are
+vetted by a per-page CDP `Fetch` interceptor at the `Response` stage.
+
+**Rationale**: The service points a real browser at caller-supplied URLs, so
+loopback, the cloud metadata endpoint and internal ranges must be unreachable.
+A front-door check alone fails to the classic bypass: a public URL that 302s
+to `169.254.169.254`.  Playwright's route handler cannot close that gap,
+because Chromium follows a 3xx internally and Playwright reports it only
+afterwards.  The CDP interceptor pauses each response, resolves `Location`
+against the request URL, and fails the request before Chromium follows it.
+Supporting choices:
+
+- The module lives in `core`, not `api`, because the scraper may not import the
+  API layer (invariant 2).
+- Verdicts are cached per origin, so same-origin sub-requests cost one lookup.
+- **Fail closed everywhere**: a failed lookup, a crashing guard, or an error
+  in the redirect handler denies the request.  A paused request must always be
+  answered or the page hangs, so the handler fails the request on any error.
+- Unsafe requests are aborted (`blockedbyclient`), never fulfilled with
+  substitute content.
+- Every resolved address is checked, IPv4-mapped IPv6 is unwrapped, and
+  obfuscated literals (`2130706433`, `0x7f.1`) are caught after resolution.
+
+**Residual limits (stated, not hidden)**: Chromium resolves the name again when
+it connects, so DNS rebinding between our lookup and its own is not closed;
+popups and cross-site iframes run in targets without the redirect interceptor.
+This is a defence in depth, not a replacement for egress filtering on the
+scraper host.
+
+### D-10: Sanitised public errors; full detail only in logs
+
+**Decision**: Every domain exception carries two strings.  `reason` is the full
+diagnostic and goes to logs.  `public_reason` is a fixed, caller-safe summary
+and is the only text written to `leads.error_message` and returned by the API.
+The service's catch-all stores `"Unexpected error: <ExceptionType>"`, never the
+exception message.
+
+**Rationale**: Playwright errors name the exact internal address and network
+failure (`net::ERR_CONNECTION_REFUSED at http://10.0.0.5:8080`), which would
+turn the enrichment endpoint into a port-scanning oracle even with the SSRF
+guard in place.  Provider errors can echo endpoints and key fragments, and
+arbitrary exception text can carry DSNs and file paths.  A fixed vocabulary of
+public reasons removes that class of leak at the source rather than filtering
+strings after the fact.  This also satisfies invariant 6: nothing is silenced,
+because the full text is logged (`logger.error` / `logger.exception`) before
+the sanitised one is stored.
+
+**Tradeoffs**: Operators must read server logs to see why a lead failed; the
+API reports only the category.  The health endpoint follows the same rule: a
+failing probe is logged and reported as `503`, not surfaced as a `500`.
+
+### D-11: `uv` for environments, locking and CI
+
+**Decision**: Manage dependencies with `uv` (`pyproject.toml` + `uv.lock`) and
+run every command through `uv run`.  `requirements.txt` is retired.  The
+project sets `[tool.uv] package = false` (an application, not a library) and
+declares dev tools in `[dependency-groups] dev` (`httpx`, `pytest`,
+`pytest-asyncio`, `ruff`).
+
+**Rationale**: One lockfile gives CI, Docker and a laptop the same dependency
+set.  It matters here because the Playwright pip package decides which Chromium
+revision is expected, so a drifting version breaks the browser, not just a
+type hint.  The Dockerfile reuses the lock: a builder stage runs
+`uv sync --frozen --no-dev` against copied manifests (cached until
+dependencies change); the runtime stage copies the venv, installs Chromium
+with `playwright install --with-deps` from that same venv, and drops to a
+non-root user (uid 1000).  Playwright's own base images were rejected because
+their bundled browser tracks a fixed Playwright release.  CI uses
+`astral-sh/setup-uv`, `uv sync --dev`, `uv run ruff check src/` and
+`uv run pytest tests/ -v`.
+
+**Tradeoffs**: Contributors need `uv` installed.  The Dockerfile pulls
+`ghcr.io/astral-sh/uv:latest`, and Compose uses `n8nio/n8n:latest`; neither is
+pinned, which trades reproducibility for convenience and is listed in §9.
+
+### D-12: Transport-agnostic `EnrichmentService` and a 202 async API
+
+**Decision**: Move the pipeline out of `src/main.py` into
+`src/services/enrichment.py` and expose it as two steps, `submit` and
+`process_lead`.  The REST API answers `202 Accepted` after `submit` and runs
+`process_lead` as a FastAPI background task; the CLI awaits both through
+`enrich_url`.
+
+**Rationale**: A scrape plus an LLM call takes tens of seconds, far beyond a
+reasonable HTTP request, so the API must return before the work finishes.
+Splitting at the point where the lead row exists makes that natural: the
+`PENDING` row is the handle the client polls (`GET /api/v1/leads/{lead_id}`).
+Keeping one service means the CLI and the API cannot diverge on idempotency or
+failure handling.  The contract:
+
+- **Status codes.**  `202` when work was queued, `200` when the URL is already
+  `PROCESSED` and `force` is false (nothing to do), `422` for an unsafe URL.
+  `submit` runs before the semaphore, so a no-op consumes no slot.
+- **`reset_to_pending`.**  `insert_pending_lead` deliberately leaves an
+  existing row alone (D-03), so a `FAILED` or forced lead would keep reporting
+  its previous outcome while the re-run is in flight, which misleads pollers.
+  Re-submission therefore resets the status and clears `error_message`
+  (keeping old `enriched_data` until overwritten).
+- **In-flight guard.**  `process_lead` ignores a lead ID already being
+  processed in this process, so a repeated `force` request cannot start a
+  second concurrent pipeline for one URL.
+- **Never raise from the background.**  Failures are logged and stored as
+  `FAILED` (D-10); an escaped exception would leave the lead `PENDING` forever
+  because nobody awaits the task.
+- **Dependency injection.**  `create_app` and `EnrichmentService` take the LLM
+  client and scraper as parameters, so the API test suite runs with fakes and
+  no browser, provider key or network.
+
+**Tradeoffs and honest limits**: `BackgroundTasks` run in the API process.  A
+restart mid-job leaves the lead `PENDING`; nothing sweeps stale `PENDING` rows,
+and the recovery path is re-submitting the URL.  `_in_flight` and the
+semaphore are per-process, so several API workers multiply effective
+concurrency and the guard no longer holds across them.  A durable queue (for
+example a worker with a persistent job table) would remove both limits and is
+the intended next step if the API moves beyond a single instance.  The API has
+no authentication of its own: Compose binds it to loopback and expects an
+upstream gateway or reverse proxy to provide access control.
+
+---
+
 ## 8. `tests/` — Offline Evaluation Suite
 
 ### Module Map
@@ -572,23 +1010,46 @@ still move a real score until the next live run.
 | Path | Responsibility |
 |---|---|
 | `pytest.ini` | `pythonpath = .` and `testpaths = tests`.  Bare `pytest` imports `src` without an editable install. |
-| `test_schemas.py` | Happy-path `EnrichedLeadPayload` construction and rejection of `LeadScoring.fit_score` above 100. |
-| `test_scoring_regression.py` | Golden-set rubric checks, band edges, negative schema cases, JSON-schema shape, prompt-band parity, fixture registration. |
+| `conftest.py` | Autouse fixture that makes `socket.create_connection`, `socket.socket.connect` and `socket.getaddrinfo` raise `AssertionError`; the suite cannot reach a network or resolve DNS. |
 | `fixtures/eval/*.md` | Scraped-page stand-ins.  The set of `*.md` names must equal the registered `_EVAL_CASES`. |
 
-### What the 21 tests cover
+Run with `uv run pytest`.  The suite needs no provider key and no Chromium
+launch; the API tests inject a fake LLM, a fake scraper and a fake host
+resolver.
 
-| Group | Count | Contract under test |
+### What the 147 tests cover
+
+| File | Tests | Contract under test |
 |---|---|---|
-| Golden fixtures | 3 | `tier1_saas.md` (92, Tier 1), `tier2_consulting.md` (54, Tier 2), `disqualified_b2c.md` (11, Disqualified).  Grounding, dimension arithmetic, tier band, DTO round-trip. |
-| Inclusive band edges | 8 | 100, 75, 74, 50, 49, 25, 24, 0.  Each edge is a valid `LeadScoring` and maps to one tier. |
-| Rejected `LeadScoring` bodies | 4 | `fit_score=-1` (`greater_than_equal`), `fit_score=101` (`less_than_equal`), `Tier 4 (Ultra)` and `high` (`literal_error` on `fit_tier`). |
-| Contract invariants | 4 | JSON schema shape for the four DTOs; prompt-band parity with `SYSTEM_PROMPT_TEMPLATE`; partition of scores 0–100; on-disk fixtures match registered cases. |
+| `test_api.py` | 42 | `/health` (200 and 503); `POST /enrich` (202, 200 for already-processed, `force`, 422 for unsafe, private-resolving and unresolvable hosts); failure recording without driver or vendor detail; unexpected-error handling; `GET /leads/{id}` (200 and 404); list pagination, filters and query validation; URL-syntax and host-resolution helpers. |
+| `test_browser.py` | 39 | Request filter (assets aborted, private destinations blocked, inline schemes passed, per-origin verdict cache, fail-closed guard); CDP redirect guard (target extraction, private redirect failed before it is followed, public resumed, fail-closed on internal error, closed-target tolerance, response-stage enablement); `new_page` guard attachment; teardown ordering under launch failure, body exceptions, close failure and cancellation; sanitised navigation errors. |
+| `test_llm_client.py` | 38 | Provider and key resolution, allowlist rejection of unsupported models, missing-key fail-fast, `api_base` restricted to OpenAI, timeout and retry forwarding and defaults, rejection of nonsensical settings, generic public errors with full logs, empty and malformed output, valid round-trip, provider loggers pinned to `WARNING`. |
+| `test_scoring_regression.py` | 19 | Three golden fixtures (grounding, sub-scores, tier, DTO round-trip), eight inclusive band edges, four out-of-contract `LeadScoring` bodies, and four contract invariants (JSON-schema shape, prompt-band parity, 0 to 100 partition, fixture registration); see D-06. |
+| `test_logging.py` | 4 | `configure_logging`: level applied when handlers already exist, application INFO logs emitted, unknown level fails fast. |
+| `test_enrichment_service.py` | 3 | `submit`: new URL becomes `PENDING`; a `FAILED` lead is reset and its stale error cleared; a forced `PROCESSED` lead returns to `PENDING`. |
 | `test_schemas.py` | 2 | One valid `EnrichedLeadPayload`; `fit_score=150` raises `ValidationError`. |
-| **Total** | **21** | |
+| **Total** | **147** | |
 
-Current cases are synchronous Pydantic and rubric checks.  CI also installs
-`pytest-asyncio` next to `pytest` and `ruff`, so an async test added later
-uses the same job.  Ruff is scoped to `ruff check src/`, matching the
-workflow.  The decision record for why this suite exists, and what it
-deliberately leaves on the live path, is D-06.
+**Not covered offline**: `PostgresLeadRepository` (no sockets allowed; verified
+through the Compose stack), a real browser launch, and live provider calls.
+Ruff is scoped to `src/` (`ruff check src/` and `ruff format --check src/`,
+both clean).  CI runs the lint check and the suite; it does not run the format
+check or build the Docker image.
+
+The decision record for why the scoring suite exists, and what it deliberately
+leaves on the live path, is D-06.
+
+---
+
+## 9. Known Limits and Next Steps
+
+| Area | Limit | Mitigation today | Next step |
+|---|---|---|---|
+| API access | No authentication. | Compose binds `app`, `postgres` and `n8n` to `127.0.0.1`; assumes an upstream gateway or reverse proxy for wider exposure. | Gateway-enforced auth, or API-key middleware. |
+| Background jobs | In-process `BackgroundTasks`; a restart mid-job leaves the lead `PENDING`. | Re-submit the URL (`reset_to_pending` re-queues it). | Durable queue and a stale-`PENDING` sweeper (D-12). |
+| Concurrency state | `_in_flight` and the semaphore are per-process. | Run a single API worker. | Shared queue or lock (D-12). |
+| SSRF | DNS rebinding between our lookup and Chromium's; popups and cross-site iframes lack the redirect guard. | Defence in depth (D-09); loopback binding. | Egress filtering on the scraper host. |
+| LLM routing | Retries only; no fallback model or provider. | `LLM_MAX_RETRIES`, `LLM_TIMEOUT_S` (D-07); failed leads can be re-submitted. | `litellm.Router` with an ordered fallback list. |
+| Postgres | No offline tests; no migration tool. | Compose stack run; idempotent `CREATE ... IF NOT EXISTS`. | Containerised integration test; Alembic or similar. |
+| Supply chain | `uv:latest` and `n8n:latest` images are unpinned. | `uv.lock` pins Python dependencies. | Pin image digests. |
+| CI | No format check, no image build. | Format verified locally. | Add `ruff format --check src/` and a `docker build` job. |
