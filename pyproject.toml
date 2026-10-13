@@ -1,6 +1,6 @@
 [project]
 name = "lead-enrichment-agent"
-version = "1.2.0"
+version = "2.0.0"
 description = "Asynchronous lead enrichment pipeline: crawls domains, extracts Markdown, and computes deterministic ICP fit scores via LLM structured outputs."
 readme = "README.md"
 requires-python = ">=3.11"

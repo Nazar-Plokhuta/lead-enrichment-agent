@@ -50,7 +50,14 @@ litellm.drop_params = True
 # litellm and the HTTP stack beneath it log request details at DEBUG (and every
 # call at INFO for httpx).  Pinning them here keeps ``LOG_LEVEL=DEBUG`` for the
 # application from also dumping provider traffic, headers included.
-for _noisy_logger in ("LiteLLM", "LiteLLM Router", "LiteLLM Proxy", "httpx", "httpcore", "openai"):
+for _noisy_logger in (
+    "LiteLLM",
+    "LiteLLM Router",
+    "LiteLLM Proxy",
+    "httpx",
+    "httpcore",
+    "openai",
+):
     logging.getLogger(_noisy_logger).setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
@@ -191,7 +198,11 @@ class LLMClient:
         """
         user_prompt = build_user_prompt(url, markdown_content)
 
-        logger.debug("Dispatching structured-output request for '%s' (model=%s)", url, self._settings.LLM_MODEL)
+        logger.debug(
+            "Dispatching structured-output request for '%s' (model=%s)",
+            url,
+            self._settings.LLM_MODEL,
+        )
 
         try:
             response = await litellm.acompletion(
@@ -213,7 +224,9 @@ class LLMClient:
             # litellm maps every provider failure (auth, rate limit, context
             # window, timeout, connection, content policy) onto subclasses of
             # ``openai.OpenAIError``, so one clause covers all providers.
-            logger.error("LLM provider error for '%s' (%s): %s", url, type(exc).__name__, exc)
+            logger.error(
+                "LLM provider error for '%s' (%s): %s", url, type(exc).__name__, exc
+            )
             raise LLMExtractionError(
                 url=url,
                 reason=f"LLM enrichment failed: {exc}",

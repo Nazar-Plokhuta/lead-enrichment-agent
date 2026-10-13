@@ -61,7 +61,9 @@ class CompanyAnalysis(BaseModel):
 class LeadScoring(BaseModel):
     """Deterministic ICP-fit assessment grounded strictly in verified page facts."""
 
-    fit_tier: Literal["Tier 1 (High)", "Tier 2 (Medium)", "Tier 3 (Low)", "Disqualified"] = Field(
+    fit_tier: Literal[
+        "Tier 1 (High)", "Tier 2 (Medium)", "Tier 3 (Low)", "Disqualified"
+    ] = Field(
         description=(
             "Categorical fit rating derived from the numerical fit_score: "
             "Tier 1 (High) = 75–100, Tier 2 (Medium) = 50–74, "

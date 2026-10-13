@@ -78,10 +78,13 @@ class LeadRepository(BaseLeadRepository):
             A plain ``dict`` representation of the row, or ``None`` if no
             record exists for the given URL.
         """
-        async with get_db_connection(self._db_path) as conn, conn.execute(
-            "SELECT * FROM leads WHERE url = ?",
-            (url,),
-        ) as cursor:
+        async with (
+            get_db_connection(self._db_path) as conn,
+            conn.execute(
+                "SELECT * FROM leads WHERE url = ?",
+                (url,),
+            ) as cursor,
+        ):
             row = await cursor.fetchone()
 
         if row is None:
@@ -93,10 +96,13 @@ class LeadRepository(BaseLeadRepository):
 
     async def get_lead_by_id(self, lead_id: int) -> dict[str, Any] | None:
         """Fetch one lead (without ``raw_markdown``) by primary key."""
-        async with get_db_connection(self._db_path) as conn, conn.execute(
-            f"SELECT {_API_COLUMNS} FROM leads WHERE id = ?",
-            (lead_id,),
-        ) as cursor:
+        async with (
+            get_db_connection(self._db_path) as conn,
+            conn.execute(
+                f"SELECT {_API_COLUMNS} FROM leads WHERE id = ?",
+                (lead_id,),
+            ) as cursor,
+        ):
             row = await cursor.fetchone()
 
         return dict(row) if row is not None else None
@@ -121,7 +127,9 @@ class LeadRepository(BaseLeadRepository):
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
 
         async with get_db_connection(self._db_path) as conn:
-            async with conn.execute(f"SELECT COUNT(*) FROM leads {where}", params) as cursor:
+            async with conn.execute(
+                f"SELECT COUNT(*) FROM leads {where}", params
+            ) as cursor:
                 count_row = await cursor.fetchone()
             async with conn.execute(
                 f"SELECT {_API_COLUMNS} FROM leads {where} ORDER BY id DESC LIMIT ? OFFSET ?",
@@ -134,7 +142,10 @@ class LeadRepository(BaseLeadRepository):
 
     async def ping(self) -> bool:
         """Run ``SELECT 1`` on a fresh connection."""
-        async with get_db_connection(self._db_path) as conn, conn.execute("SELECT 1") as cursor:
+        async with (
+            get_db_connection(self._db_path) as conn,
+            conn.execute("SELECT 1") as cursor,
+        ):
             row = await cursor.fetchone()
         return row is not None
 
@@ -205,7 +216,9 @@ class LeadRepository(BaseLeadRepository):
 
         # The SELECT is guaranteed to return a row: either we just inserted it,
         # or it existed before.  A None result would indicate data corruption.
-        assert row is not None, f"Expected lead row for url='{url}' after INSERT OR IGNORE"
+        assert row is not None, (
+            f"Expected lead row for url='{url}' after INSERT OR IGNORE"
+        )
         lead_id: int = row["id"]
         logger.debug("Lead record resolved | url='%s' id=%d", url, lead_id)
         return lead_id

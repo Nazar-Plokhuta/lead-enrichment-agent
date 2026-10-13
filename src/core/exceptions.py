@@ -42,7 +42,11 @@ class ScrapeError(LeadEnrichmentError):
     """
 
     def __init__(
-        self, url: str, reason: str, *, public_reason: str = "Page could not be retrieved"
+        self,
+        url: str,
+        reason: str,
+        *,
+        public_reason: str = "Page could not be retrieved",
     ) -> None:
         self.url = url
         self.reason = reason

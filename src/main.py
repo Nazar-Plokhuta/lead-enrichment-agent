@@ -130,8 +130,10 @@ async def _print_results_table(repo: BaseLeadRepository, urls: list[str]) -> Non
         status: str = row["status"] or "—"
 
         status_style = (
-            "green" if status == "PROCESSED"
-            else "red" if status == "FAILED"
+            "green"
+            if status == "PROCESSED"
+            else "red"
+            if status == "FAILED"
             else "yellow"
         )
 
@@ -219,7 +221,9 @@ async def _run(repo: BaseLeadRepository, urls: list[str], force: bool) -> None:
     # Fan out: schedule all URLs concurrently, bounded by the service's semaphore.
     tasks = [asyncio.create_task(service.enrich_url(url, force=force)) for url in urls]
 
-    results: list[Literal["processed", "skipped", "failed"]] = await asyncio.gather(*tasks)
+    results: list[Literal["processed", "skipped", "failed"]] = await asyncio.gather(
+        *tasks
+    )
 
     # -----------------------------------------------------------------
     # Run summary panel

@@ -111,7 +111,9 @@ async def fetch_page_markdown(url: str, timeout_ms: int = 20_000) -> str:
             html: str = await page.content()
         except PlaywrightError as exc:
             # `page.content()` can fail if the renderer crashed after navigation.
-            logger.warning("Failed to retrieve DOM content for %s: %s", url, exc.message)
+            logger.warning(
+                "Failed to retrieve DOM content for %s: %s", url, exc.message
+            )
             raise ScrapeError(
                 url=url,
                 reason=f"DOM content retrieval failed: {exc.message}",

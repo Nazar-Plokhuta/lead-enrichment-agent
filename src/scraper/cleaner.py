@@ -60,14 +60,16 @@ def extract_markdown(html_content: str, max_chars: int = 15_000) -> str:
         html_content,
         config=_TRAFILATURA_CONFIG,
         include_tables=True,
-        include_links=False,      # URLs add noise without semantic value
+        include_links=False,  # URLs add noise without semantic value
         include_images=False,
         output_format="markdown",
-        no_fallback=False,        # Allow readability fallback for thin pages
+        no_fallback=False,  # Allow readability fallback for thin pages
     )
 
     if not extracted:
-        logger.warning("trafilatura returned no content — HTML may be a JavaScript shell")
+        logger.warning(
+            "trafilatura returned no content — HTML may be a JavaScript shell"
+        )
         return ""
 
     return _truncate_on_word_boundary(extracted, max_chars)

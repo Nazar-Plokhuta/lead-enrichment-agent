@@ -66,7 +66,9 @@ class PostgresLeadRepository(BaseLeadRepository):
     @property
     def _require_pool(self) -> asyncpg.Pool:
         if self._pool is None:
-            raise RuntimeError("PostgresLeadRepository.init_db() must be awaited before use")
+            raise RuntimeError(
+                "PostgresLeadRepository.init_db() must be awaited before use"
+            )
         return self._pool
 
     async def init_db(self) -> None:
@@ -83,7 +85,9 @@ class PostgresLeadRepository(BaseLeadRepository):
             self._pool = None
 
     async def get_lead_by_url(self, url: str) -> dict[str, Any] | None:
-        row = await self._require_pool.fetchrow("SELECT * FROM leads WHERE url = $1", url)
+        row = await self._require_pool.fetchrow(
+            "SELECT * FROM leads WHERE url = $1", url
+        )
         return dict(row) if row is not None else None
 
     async def insert_pending_lead(self, url: str, domain: str) -> int:
