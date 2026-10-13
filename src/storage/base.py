@@ -37,6 +37,37 @@ class BaseLeadRepository(ABC):
         """Return the full lead row for *url*, or ``None`` if absent."""
 
     @abstractmethod
+    async def get_lead_by_id(self, lead_id: int) -> dict[str, Any] | None:
+        """Return the API-facing lead row for *lead_id*, or ``None`` if absent.
+
+        The row carries every column except ``raw_markdown``, which is an
+        audit artifact too large to ship in API responses.
+        """
+
+    @abstractmethod
+    async def list_leads(
+        self,
+        skip: int = 0,
+        limit: int = 50,
+        fit_tier: str | None = None,
+        status: str | None = None,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Return one page of leads (newest first) and the total match count.
+
+        *fit_tier* and *status* are exact-match filters; ``None`` disables a
+        filter.  The total ignores *skip* and *limit* so callers can paginate.
+        Rows have the same shape as ``get_lead_by_id``.
+        """
+
+    @abstractmethod
+    async def ping(self) -> bool:
+        """Verify the backend is reachable.
+
+        Returns ``True`` on success; connectivity failures propagate as
+        exceptions so that callers can log the cause.
+        """
+
+    @abstractmethod
     async def insert_pending_lead(self, url: str, domain: str) -> int:
         """Create a ``PENDING`` lead, or return the ID of the existing row.
 

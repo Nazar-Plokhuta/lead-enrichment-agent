@@ -34,6 +34,13 @@ logger = logging.getLogger(__name__)
 # IN-lists are chunked well below that limit.
 _IN_CLAUSE_BATCH_SIZE = 500
 
+# Everything except ``raw_markdown``: API reads must not drag the archived page
+# body (often tens of KB per row) across the wire.
+_API_COLUMNS = (
+    "id, url, domain, company_name, fit_score, fit_tier, enriched_data, "
+    "status, error_message, created_at, updated_at"
+)
+
 
 class LeadRepository(BaseLeadRepository):
     """Async data-access object for lead persistence.
@@ -83,6 +90,53 @@ class LeadRepository(BaseLeadRepository):
         # ``aiosqlite.Row`` supports ``dict()`` conversion via its mapping
         # interface; this keeps the caller free from aiosqlite internals.
         return dict(row)
+
+    async def get_lead_by_id(self, lead_id: int) -> dict[str, Any] | None:
+        """Fetch one lead (without ``raw_markdown``) by primary key."""
+        async with get_db_connection(self._db_path) as conn, conn.execute(
+            f"SELECT {_API_COLUMNS} FROM leads WHERE id = ?",
+            (lead_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+
+        return dict(row) if row is not None else None
+
+    async def list_leads(
+        self,
+        skip: int = 0,
+        limit: int = 50,
+        fit_tier: str | None = None,
+        status: str | None = None,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Fetch one page of leads, newest first, plus the unpaginated total."""
+        # Only fixed SQL fragments are interpolated; filter values are bound.
+        clauses: list[str] = []
+        params: list[Any] = []
+        if fit_tier is not None:
+            clauses.append("fit_tier = ?")
+            params.append(fit_tier)
+        if status is not None:
+            clauses.append("status = ?")
+            params.append(status)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+
+        async with get_db_connection(self._db_path) as conn:
+            async with conn.execute(f"SELECT COUNT(*) FROM leads {where}", params) as cursor:
+                count_row = await cursor.fetchone()
+            async with conn.execute(
+                f"SELECT {_API_COLUMNS} FROM leads {where} ORDER BY id DESC LIMIT ? OFFSET ?",
+                [*params, limit, skip],
+            ) as cursor:
+                rows = [dict(row) for row in await cursor.fetchall()]
+
+        total: int = count_row[0] if count_row is not None else 0
+        return rows, total
+
+    async def ping(self) -> bool:
+        """Run ``SELECT 1`` on a fresh connection."""
+        async with get_db_connection(self._db_path) as conn, conn.execute("SELECT 1") as cursor:
+            row = await cursor.fetchone()
+        return row is not None
 
     async def get_leads_by_urls(self, urls: list[str]) -> list[dict[str, Any]]:
         """Fetch summary rows (``url``, ``company_name``, ``fit_score``,

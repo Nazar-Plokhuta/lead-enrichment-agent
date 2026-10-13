@@ -3,15 +3,11 @@ Async CLI orchestration entry point for the lead-enrichment agent.
 
 Execution model
 ---------------
-Each URL is processed through a five-stage pipeline:
-
-    1. ``insert_pending_lead`` — creates (or retrieves) the
-       database record; establishes the lead_id used by all subsequent stages.
-    2. ``fetch_page_markdown`` — headless browser scrape + DOM normalisation.
-    3. ``LLMClient.enrich_lead`` — structured-output extraction via OpenAI.
-    4. ``save_lead_success`` — persist enriched payload.
-    5. On ``ScrapeError`` or ``LLMExtractionError``: ``mark_lead_failed`` so
-       the record is queryable for post-mortem analysis, then continue.
+Each URL is handed to ``EnrichmentService.enrich_url``, which runs the shared
+pipeline (pending record → scrape → LLM extraction → persist, or ``FAILED``
+with the error recorded).  The same service backs the REST API, so both entry
+points have identical semantics; this module only owns argument parsing and
+Rich presentation.
 
 Concurrency
 -----------
@@ -33,7 +29,6 @@ import argparse
 import asyncio
 import logging
 from typing import Literal
-from urllib.parse import urlparse
 
 from rich.console import Console
 from rich.logging import RichHandler
@@ -42,9 +37,8 @@ from rich.table import Table
 from rich.text import Text
 
 from src.config import get_repository, get_settings
-from src.core.exceptions import LLMExtractionError, ScrapeError
 from src.llm.client import LLMClient
-from src.scraper.fetcher import fetch_page_markdown
+from src.services.enrichment import EnrichmentService
 from src.storage.base import BaseLeadRepository
 
 # ---------------------------------------------------------------------------
@@ -93,28 +87,6 @@ _TIER_STYLES: dict[str, str] = {
     "Tier 3 (Low)": "bold cyan",
     "Disqualified": "bold red",  # vibrant, not dim — dim renders as murky grey
 }
-
-# ---------------------------------------------------------------------------
-# Domain helpers
-# ---------------------------------------------------------------------------
-
-
-def _extract_domain(url: str) -> str:
-    """Parse the registered domain from a fully-qualified URL.
-
-    Uses ``urllib.parse.urlparse`` so that scheme, path, query-string, and
-    fragment components are stripped, leaving only the ``netloc``.  A leading
-    ``www.`` prefix is preserved intentionally — the domain column is used for
-    grouping, not deduplication at the TLD level.
-
-    Args:
-        url: Fully-qualified URL (e.g. ``"https://www.example.com/about"``).
-
-    Returns:
-        The ``netloc`` component of the URL (e.g. ``"www.example.com"``).
-    """
-    return urlparse(url).netloc
-
 
 # ---------------------------------------------------------------------------
 # Results table
@@ -171,90 +143,6 @@ async def _print_results_table(repo: BaseLeadRepository, urls: list[str]) -> Non
         )
 
     _console.print(table)
-
-
-# ---------------------------------------------------------------------------
-# Per-URL pipeline
-# ---------------------------------------------------------------------------
-
-
-async def _process_url(
-    url: str,
-    *,
-    repo: BaseLeadRepository,
-    llm_client: LLMClient,
-    semaphore: asyncio.Semaphore,
-    force: bool,
-) -> Literal["processed", "skipped", "failed"]:
-    """Run the full enrichment pipeline for a single URL.
-
-    Acquires the semaphore before any I/O so that at most
-    ``settings.MAX_CONCURRENT_SCRAPES`` pipelines run concurrently.
-
-    Args:
-        url:        The company URL to enrich.
-        repo:       Shared repository instance for all database ops.
-        llm_client: Shared ``LLMClient`` instance for OpenAI calls.
-        semaphore:  Concurrency gate shared across all URL tasks.
-        force:      When ``True``, re-enrich URLs already in ``'PROCESSED'``
-                    state; when ``False``, skip them.
-
-    Returns:
-        A ``Literal`` outcome string:
-        - ``"processed"`` — pipeline completed and payload persisted.
-        - ``"skipped"``   — URL was already ``'PROCESSED'`` and ``--force``
-                            was not supplied; no work performed.
-        - ``"failed"``    — a ``ScrapeError`` or ``LLMExtractionError`` was
-                            raised; the database record is marked ``'FAILED'``.
-    """
-    # -----------------------------------------------------------------
-    # Idempotency guard — check before acquiring the semaphore so that
-    # already-processed URLs consume zero concurrency slots.
-    # -----------------------------------------------------------------
-    existing = await repo.get_lead_by_url(url)
-    if existing and existing["status"] == "PROCESSED" and not force:
-        logger.info("Skipping already-processed URL (use --force to re-enrich): %s", url)
-        return "skipped"
-
-    async with semaphore:
-        domain = _extract_domain(url)
-        lead_id: int | None = None
-
-        try:
-            # Stage 1 — ensure a database record exists and obtain its PK.
-            lead_id = await repo.insert_pending_lead(url, domain)
-            logger.info("Pipeline start | url='%s' id=%d", url, lead_id)
-
-            # Stage 2 — scrape: headless browser → clean Markdown.
-            markdown = await fetch_page_markdown(url, timeout_ms=settings.PAGE_TIMEOUT_MS)
-
-            # Stage 3 — enrich: Markdown → validated EnrichedLeadPayload.
-            payload = await llm_client.enrich_lead(url, markdown)
-
-            # Stage 4 — persist: structured payload → database.
-            await repo.save_lead_success(lead_id, payload, markdown)
-
-            logger.info(
-                "Pipeline success | url='%s' company='%s' score=%d tier='%s'",
-                url,
-                payload.company_name,
-                payload.scoring.fit_score,
-                payload.scoring.fit_tier,
-            )
-            return "processed"
-
-        except (ScrapeError, LLMExtractionError) as exc:
-            # Both error types carry a ``reason`` attribute with a
-            # human-readable failure description suitable for storage.
-            error_msg = str(exc)
-            logger.error("Pipeline failure | url='%s' error='%s'", url, error_msg)
-
-            if lead_id is not None:
-                # Best-effort: persist failure state so the record is
-                # queryable for re-runs or post-mortem analysis.
-                await repo.mark_lead_failed(lead_id, error_msg)
-
-            return "failed"
 
 
 # ---------------------------------------------------------------------------
@@ -321,22 +209,15 @@ async def main() -> None:
 
 async def _run(repo: BaseLeadRepository, urls: list[str], force: bool) -> None:
     """Fan out the pipeline over *urls* and print the summary and results table."""
-    llm_client = LLMClient(settings)
-    semaphore = asyncio.Semaphore(settings.MAX_CONCURRENT_SCRAPES)
+    service = EnrichmentService(
+        repo,
+        LLMClient(settings),
+        asyncio.Semaphore(settings.MAX_CONCURRENT_SCRAPES),
+        page_timeout_ms=settings.PAGE_TIMEOUT_MS,
+    )
 
-    # Fan out: schedule all URLs concurrently, bounded by the semaphore.
-    tasks = [
-        asyncio.create_task(
-            _process_url(
-                url,
-                repo=repo,
-                llm_client=llm_client,
-                semaphore=semaphore,
-                force=force,
-            )
-        )
-        for url in urls
-    ]
+    # Fan out: schedule all URLs concurrently, bounded by the service's semaphore.
+    tasks = [asyncio.create_task(service.enrich_url(url, force=force)) for url in urls]
 
     results: list[Literal["processed", "skipped", "failed"]] = await asyncio.gather(*tasks)
 

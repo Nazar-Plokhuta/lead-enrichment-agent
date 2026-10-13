@@ -41,6 +41,12 @@ CREATE INDEX IF NOT EXISTS idx_leads_domain    ON leads(domain);
 CREATE INDEX IF NOT EXISTS idx_leads_fit_score ON leads(fit_score);
 """
 
+# Everything except ``raw_markdown`` (see the SQLite driver for the rationale).
+_API_COLUMNS = (
+    "id, url, domain, company_name, fit_score, fit_tier, enriched_data, "
+    "status, error_message, created_at, updated_at"
+)
+
 
 class PostgresLeadRepository(BaseLeadRepository):
     """PostgreSQL implementation of ``BaseLeadRepository``.
@@ -152,6 +158,44 @@ class PostgresLeadRepository(BaseLeadRepository):
             lead_id,
         )
         logger.warning("Lead marked FAILED | id=%d reason='%s'", lead_id, error_message)
+
+    async def get_lead_by_id(self, lead_id: int) -> dict[str, Any] | None:
+        row = await self._require_pool.fetchrow(
+            f"SELECT {_API_COLUMNS} FROM leads WHERE id = $1", lead_id
+        )
+        return dict(row) if row is not None else None
+
+    async def list_leads(
+        self,
+        skip: int = 0,
+        limit: int = 50,
+        fit_tier: str | None = None,
+        status: str | None = None,
+    ) -> tuple[list[dict[str, Any]], int]:
+        # Only fixed SQL fragments are interpolated; filter values are bound.
+        clauses: list[str] = []
+        params: list[Any] = []
+        if fit_tier is not None:
+            params.append(fit_tier)
+            clauses.append(f"fit_tier = ${len(params)}")
+        if status is not None:
+            params.append(status)
+            clauses.append(f"status = ${len(params)}")
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+
+        pool = self._require_pool
+        total: int = await pool.fetchval(f"SELECT COUNT(*) FROM leads {where}", *params)
+        rows = await pool.fetch(
+            f"SELECT {_API_COLUMNS} FROM leads {where} "
+            f"ORDER BY id DESC LIMIT ${len(params) + 1} OFFSET ${len(params) + 2}",
+            *params,
+            limit,
+            skip,
+        )
+        return [dict(row) for row in rows], total
+
+    async def ping(self) -> bool:
+        return await self._require_pool.fetchval("SELECT 1") == 1
 
     async def get_leads_by_urls(self, urls: list[str]) -> list[dict[str, Any]]:
         if not urls:
