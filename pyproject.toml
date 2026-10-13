@@ -1,0 +1,26 @@
+[project]
+name = "lead-enrichment-agent"
+version = "1.2.0"
+description = "Asynchronous lead enrichment pipeline: crawls domains, extracts Markdown, and computes deterministic ICP fit scores via LLM structured outputs."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "playwright>=1.44.0",
+    "trafilatura>=2.0.0",
+    "openai>=1.30.0",
+    "pydantic>=2.7.0",
+    "pydantic-settings>=2.3.0",
+    "aiosqlite>=0.20.0",
+    "rich>=13.7.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "ruff>=0.4.0",
+]
+
+[tool.uv]
+# Application, not a distributable library: skip building/installing the project itself.
+package = false

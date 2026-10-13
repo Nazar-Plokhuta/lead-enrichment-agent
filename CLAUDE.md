@@ -4,14 +4,14 @@
 High-performance, fully asynchronous pipeline crawling target domains, extracting normalized Markdown, and computing deterministic ICP fit scores via LLM Structured Outputs into SQLite/PostgreSQL storage.
 
 ## Build, Test & Lint Commands
-Run commands inside the active virtual environment (`.venv`):
+Dependencies and the virtual environment are managed by `uv` (`pyproject.toml` + `uv.lock`). Run all commands through `uv run`:
 
-- Run test suite: `pytest`
-- Run specific test file: `pytest tests/test_scoring_regression.py -v`
-- Lint checks: `ruff check src/`
-- Format checks: `ruff format --check src/`
-- Format code: `ruff format src/`
-- Run CLI manually: `python -m src.main https://linear.app`
+- Run test suite: `uv run pytest`
+- Run specific test file: `uv run pytest tests/test_scoring_regression.py -v`
+- Lint checks: `uv run ruff check src/`
+- Format checks: `uv run ruff format --check src/`
+- Format code: `uv run ruff format src/`
+- Run CLI manually: `uv run python -m src.main https://linear.app`
 
 IMPORTANT: The test suite runs strictly offline. Outbound network sockets are blocked via `socket.create_connection` autouse fixture. Never add real network calls or OpenAI API requests into `tests/`.
 
