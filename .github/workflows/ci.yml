@@ -34,6 +34,6 @@ jobs:
       - name: Run Pytest Test Suite
         env:
           OPENAI_API_KEY: "mock-ci-key-do-not-call-api"
-          OPENAI_MODEL: "gpt-4o-mini"
+          LLM_MODEL: "gpt-4o-mini"
           DATABASE_PATH: ":memory:"
         run: uv run pytest tests/ -v

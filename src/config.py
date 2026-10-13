@@ -28,10 +28,17 @@ class Settings(BaseSettings):
     )
 
     # --- LLM ---
-    OPENAI_API_KEY: SecretStr
-    OPENAI_MODEL: str = "gpt-4o-mini"
-    # Optional base URL override — set to route requests through OpenRouter,
-    # a self-hosted proxy, or any OpenAI-compatible endpoint.
+    # litellm model identifier; the prefix selects the provider and API key,
+    # e.g. "gpt-4o-mini", "claude-3-5-sonnet-latest",
+    # "openrouter/anthropic/claude-3.5-sonnet".
+    LLM_MODEL: str = "gpt-4o-mini"
+    # Only the key for the configured provider is required; LLMClient fails
+    # fast at construction when it is missing.
+    OPENAI_API_KEY: SecretStr | None = None
+    ANTHROPIC_API_KEY: SecretStr | None = None
+    OPENROUTER_API_KEY: SecretStr | None = None
+    # Optional base URL override (self-hosted proxy or OpenAI-compatible
+    # endpoint), forwarded to litellm as ``api_base``.
     OPENAI_BASE_URL: str | None = None
 
     # --- Persistence ---
@@ -82,5 +89,7 @@ def get_repository(settings: Settings | None = None) -> "BaseLeadRepository":
 
     dsn = settings.DATABASE_URL.get_secret_value()
     if not dsn.startswith(_POSTGRES_SCHEMES):
-        raise ValueError("DATABASE_URL must start with 'postgresql://' or 'postgres://'")
+        raise ValueError(
+            "DATABASE_URL must start with 'postgresql://' or 'postgres://'"
+        )
     return PostgresLeadRepository(dsn)
