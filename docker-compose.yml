@@ -44,5 +44,22 @@ services:
       retries: 3
       start_period: 20s
 
+  n8n:
+    image: docker.n8n.io/n8nio/n8n:latest
+    restart: unless-stopped
+    depends_on:
+      app:
+        condition: service_healthy
+    environment:
+      # Cookies are only marked Secure over HTTPS; this stack serves plain HTTP on loopback.
+      N8N_SECURE_COOKIE: "false"
+      GENERIC_TIMEZONE: UTC
+    # Loopback only: the n8n editor must not be reachable from the LAN.
+    ports:
+      - "127.0.0.1:5678:5678"
+    volumes:
+      - n8n_data:/home/node/.n8n
+
 volumes:
   postgres_data:
+  n8n_data:

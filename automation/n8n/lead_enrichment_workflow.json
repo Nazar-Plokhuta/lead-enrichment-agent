@@ -1,0 +1,351 @@
+{
+  "name": "Lead Enrichment Pipeline",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "lead-enrichment",
+        "responseMode": "onReceived",
+        "options": {}
+      },
+      "id": "a1f0c1d2-0001-4a00-8000-000000000001",
+      "name": "Webhook: Company URL",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [0, 300],
+      "webhookId": "5d1c2b7e-0a64-4c58-9a8e-1f6f3a0b7c11"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://app:8000/api/v1/enrich",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ url: $json.body.url, force: $json.body.force === true }) }}",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "id": "a1f0c1d2-0002-4a00-8000-000000000002",
+      "name": "Enrich Lead",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "resume": "timeInterval",
+        "amount": 10,
+        "unit": "seconds"
+      },
+      "id": "a1f0c1d2-0003-4a00-8000-000000000003",
+      "name": "Wait for Enrichment",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [480, 300],
+      "webhookId": "5d1c2b7e-0a64-4c58-9a8e-1f6f3a0b7c12"
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=http://app:8000/api/v1/leads/{{ $('Enrich Lead').item.json.lead_id }}",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "id": "a1f0c1d2-0004-4a00-8000-000000000004",
+      "name": "Poll Lead Status",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [720, 300]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "id": "c0000001-0000-4000-8000-000000000001",
+                    "leftValue": "={{ $json.status }}",
+                    "rightValue": "PROCESSED",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Processed"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "id": "c0000002-0000-4000-8000-000000000002",
+                    "leftValue": "={{ $json.status }}",
+                    "rightValue": "FAILED",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Failed"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "id": "c0000003-0000-4000-8000-000000000003",
+                    "leftValue": "={{ $json.status }}",
+                    "rightValue": "PENDING",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  },
+                  {
+                    "id": "c0000004-0000-4000-8000-000000000004",
+                    "leftValue": "={{ $runIndex }}",
+                    "rightValue": 11,
+                    "operator": {
+                      "type": "number",
+                      "operation": "lt"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Still Pending"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra",
+          "renameFallbackOutput": "Timed Out"
+        }
+      },
+      "id": "a1f0c1d2-0005-4a00-8000-000000000005",
+      "name": "Check Status",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [960, 280]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "c0000005-0000-4000-8000-000000000005",
+              "leftValue": "={{ $json.fit_tier }}",
+              "rightValue": "Tier 1",
+              "operator": {
+                "type": "string",
+                "operation": "startsWith"
+              }
+            },
+            {
+              "id": "c0000006-0000-4000-8000-000000000006",
+              "leftValue": "={{ $json.fit_score }}",
+              "rightValue": 75,
+              "operator": {
+                "type": "number",
+                "operation": "gte"
+              }
+            }
+          ],
+          "combinator": "or"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "id": "a1f0c1d2-0006-4a00-8000-000000000006",
+      "name": "Is ICP Qualified?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [1220, 180]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "d0000001-0000-4000-8000-000000000001",
+              "name": "route",
+              "value": "notify_sales",
+              "type": "string"
+            },
+            {
+              "id": "d0000002-0000-4000-8000-000000000002",
+              "name": "message",
+              "value": "=:dart: *Qualified lead* — {{ $json.company_name || $json.url }}\n*Tier:* {{ $json.fit_tier }} | *Score:* {{ $json.fit_score }}/100\n<{{ $json.url }}|Open website>",
+              "type": "string"
+            },
+            {
+              "id": "d0000003-0000-4000-8000-000000000003",
+              "name": "lead",
+              "value": "={{ { id: $json.id, url: $json.url, company_name: $json.company_name, fit_score: $json.fit_score, fit_tier: $json.fit_tier, enriched_data: $json.enriched_data } }}",
+              "type": "object"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "a1f0c1d2-0007-4a00-8000-000000000007",
+      "name": "Format Sales Notification",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [1480, 80],
+      "notes": "Mock branch action. Replace with a Slack, Telegram or CRM node consuming `message` / `lead`."
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "d0000004-0000-4000-8000-000000000004",
+              "name": "route",
+              "value": "nurture",
+              "type": "string"
+            },
+            {
+              "id": "d0000005-0000-4000-8000-000000000005",
+              "name": "message",
+              "value": "=Lead {{ $json.company_name || $json.url }} scored {{ $json.fit_score }} ({{ $json.fit_tier }}); routed to nurture.",
+              "type": "string"
+            },
+            {
+              "id": "d0000006-0000-4000-8000-000000000006",
+              "name": "lead",
+              "value": "={{ { id: $json.id, url: $json.url, company_name: $json.company_name, fit_score: $json.fit_score, fit_tier: $json.fit_tier } }}",
+              "type": "object"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "a1f0c1d2-0008-4a00-8000-000000000008",
+      "name": "Route to Nurture",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [1480, 280],
+      "notes": "Mock branch action. Replace with a CRM / mailing-list node."
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "d0000007-0000-4000-8000-000000000007",
+              "name": "route",
+              "value": "enrichment_failed",
+              "type": "string"
+            },
+            {
+              "id": "d0000008-0000-4000-8000-000000000008",
+              "name": "message",
+              "value": "=Enrichment failed for {{ $json.url }}: {{ $json.error_message || 'unknown error' }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "a1f0c1d2-0009-4a00-8000-000000000009",
+      "name": "Report Failure",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [1220, 420],
+      "notes": "Mock alert. Replace with an error-channel notification."
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "d0000009-0000-4000-8000-000000000009",
+              "name": "route",
+              "value": "enrichment_timeout",
+              "type": "string"
+            },
+            {
+              "id": "d0000010-0000-4000-8000-000000000010",
+              "name": "message",
+              "value": "=Lead {{ $json.id }} ({{ $json.url }}) was still {{ $json.status }} after 11 polls (~2 min); giving up.",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "a1f0c1d2-0010-4a00-8000-000000000011",
+      "name": "Report Timeout",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [1220, 560],
+      "notes": "Polling is capped so a stuck lead cannot loop forever."
+    }
+  ],
+  "connections": {
+    "Webhook: Company URL": {
+      "main": [[{ "node": "Enrich Lead", "type": "main", "index": 0 }]]
+    },
+    "Enrich Lead": {
+      "main": [[{ "node": "Wait for Enrichment", "type": "main", "index": 0 }]]
+    },
+    "Wait for Enrichment": {
+      "main": [[{ "node": "Poll Lead Status", "type": "main", "index": 0 }]]
+    },
+    "Poll Lead Status": {
+      "main": [[{ "node": "Check Status", "type": "main", "index": 0 }]]
+    },
+    "Check Status": {
+      "main": [
+        [{ "node": "Is ICP Qualified?", "type": "main", "index": 0 }],
+        [{ "node": "Report Failure", "type": "main", "index": 0 }],
+        [{ "node": "Wait for Enrichment", "type": "main", "index": 0 }],
+        [{ "node": "Report Timeout", "type": "main", "index": 0 }]
+      ]
+    },
+    "Is ICP Qualified?": {
+      "main": [
+        [{ "node": "Format Sales Notification", "type": "main", "index": 0 }],
+        [{ "node": "Route to Nurture", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "active": false,
+  "tags": []
+}
