@@ -75,6 +75,15 @@ class BaseLeadRepository(ABC):
         """
 
     @abstractmethod
+    async def reset_to_pending(self, lead_id: int) -> None:
+        """Set the status back to ``PENDING`` and clear ``error_message``.
+
+        Called when an existing lead is queued for another run, so pollers do
+        not read the previous run's outcome.  Previously enriched data is kept
+        until the new run overwrites it.
+        """
+
+    @abstractmethod
     async def save_lead_success(
         self,
         lead_id: int,

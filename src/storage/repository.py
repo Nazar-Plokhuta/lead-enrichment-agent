@@ -210,6 +210,22 @@ class LeadRepository(BaseLeadRepository):
         logger.debug("Lead record resolved | url='%s' id=%d", url, lead_id)
         return lead_id
 
+    async def reset_to_pending(self, lead_id: int) -> None:
+        """Mark an existing lead ``'PENDING'`` again and clear its error."""
+        async with get_db_connection(self._db_path) as conn:
+            await conn.execute(
+                """
+                UPDATE leads
+                SET
+                    status        = 'PENDING',
+                    error_message = NULL,
+                    updated_at    = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (lead_id,),
+            )
+            await conn.commit()
+
     async def save_lead_success(
         self,
         lead_id: int,

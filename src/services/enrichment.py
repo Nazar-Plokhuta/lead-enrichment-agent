@@ -101,6 +101,11 @@ class EnrichmentService:
             return Submission(existing["id"], url, "PROCESSED", needs_processing=False)
 
         lead_id = await self._repo.insert_pending_lead(url, extract_domain(url))
+        if existing is not None:
+            # ``insert_pending_lead`` leaves an existing row untouched, so a
+            # FAILED or forced-PROCESSED lead would keep reporting its old
+            # outcome while the re-run is in flight and mislead pollers.
+            await self._repo.reset_to_pending(lead_id)
         return Submission(lead_id, url, "PENDING", needs_processing=True)
 
     async def process_lead(self, lead_id: int, url: str) -> Outcome:
@@ -146,7 +151,8 @@ class EnrichmentService:
             await self._repo.save_lead_success(lead_id, payload, markdown)
         except (ScrapeError, LLMExtractionError) as exc:
             logger.error("Pipeline failure | url='%s' error='%s'", url, exc)
-            await self._record_failure(lead_id, str(exc))
+            # Only the sanitised summary is persisted; the full text stays in logs.
+            await self._record_failure(lead_id, exc.public_reason)
             return "failed"
         except Exception as exc:
             # Catch-all by design: see ``process_lead``.  The full traceback is

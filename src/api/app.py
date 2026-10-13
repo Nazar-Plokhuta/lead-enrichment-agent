@@ -11,6 +11,7 @@ from fastapi import FastAPI
 
 from src.api.routes import router
 from src.config import Settings, get_repository, get_settings
+from src.core.log_config import configure_logging
 from src.llm.client import LLMClient
 from src.scraper.fetcher import fetch_page_markdown
 from src.services.enrichment import EnrichmentService, Scraper
@@ -37,6 +38,7 @@ def create_app(
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         cfg = settings or get_settings()
+        configure_logging(cfg.LOG_LEVEL)
         repo = get_repository(cfg)
         # Schema (and, for Postgres, the pool) must exist before any request.
         await repo.init_db()

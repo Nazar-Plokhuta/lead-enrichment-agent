@@ -20,7 +20,7 @@ from src.api.app import create_app
 from src.api.routes import get_host_resolver
 from src.api.security import UnsafeUrlError, assert_public_host, validate_url_syntax
 from src.config import Settings
-from src.core.exceptions import ScrapeError
+from src.core.exceptions import LLMExtractionError, ScrapeError
 from src.llm.schemas import (
     CompanyAnalysis,
     EnrichedLeadPayload,
@@ -183,16 +183,40 @@ async def test_enrich_already_processed_is_not_rerun_unless_forced(
     assert len(scraper.calls) == 2
 
 
-async def test_scrape_failure_is_recorded_on_lead(
+async def test_scrape_failure_is_recorded_without_driver_detail(
     client: httpx.AsyncClient, scraper: FakeScraper
 ) -> None:
-    scraper.error = ScrapeError("https://down.example", "Navigation timed out")
+    scraper.error = ScrapeError(
+        "https://down.example",
+        "net::ERR_CONNECTION_REFUSED at http://10.0.0.5:8080",
+        public_reason="Page could not be loaded",
+    )
     resp = await client.post("/api/v1/enrich", json={"url": "https://down.example"})
     assert resp.status_code == 202
 
     lead = (await client.get(f"/api/v1/leads/{resp.json()['lead_id']}")).json()
     assert lead["status"] == "FAILED"
-    assert "Navigation timed out" in lead["error_message"]
+    assert lead["error_message"] == "Page could not be loaded"
+    assert "10.0.0.5" not in str(lead)
+
+
+async def test_llm_failure_is_recorded_without_vendor_detail(
+    client: httpx.AsyncClient, llm: FakeLLM
+) -> None:
+    async def _fail(url: str, markdown_content: str) -> EnrichedLeadPayload:
+        raise LLMExtractionError(
+            url,
+            "Incorrect API key provided: sk-proj-****abcd at https://api.openai.com",
+            public_reason="LLM provider request failed (AuthenticationError)",
+        )
+
+    llm.enrich_lead = _fail  # type: ignore[method-assign]
+    resp = await client.post("/api/v1/enrich", json={"url": "https://llm-fail.example"})
+
+    lead = (await client.get(f"/api/v1/leads/{resp.json()['lead_id']}")).json()
+    assert lead["status"] == "FAILED"
+    assert lead["error_message"] == "LLM provider request failed (AuthenticationError)"
+    assert "sk-proj" not in str(lead)
 
 
 async def test_unexpected_pipeline_error_marks_lead_failed(

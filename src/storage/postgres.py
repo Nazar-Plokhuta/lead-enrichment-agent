@@ -107,6 +107,19 @@ class PostgresLeadRepository(BaseLeadRepository):
         logger.debug("Lead record resolved | url='%s' id=%d", url, lead_id)
         return lead_id
 
+    async def reset_to_pending(self, lead_id: int) -> None:
+        await self._require_pool.execute(
+            """
+            UPDATE leads
+            SET
+                status        = 'PENDING',
+                error_message = NULL,
+                updated_at    = now()
+            WHERE id = $1
+            """,
+            lead_id,
+        )
+
     async def save_lead_success(
         self,
         lead_id: int,

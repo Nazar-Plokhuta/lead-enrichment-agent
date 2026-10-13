@@ -14,7 +14,15 @@ imports — none of them need to import each other to signal failures.
 
 
 class LeadEnrichmentError(Exception):
-    """Base class for all project-specific errors."""
+    """Base class for all project-specific errors.
+
+    Subclasses carry two descriptions of a failure.  ``reason`` is the full
+    diagnostic for server-side logs and may contain driver or vendor detail
+    (internal hostnames, masked credentials).  ``public_reason`` is the fixed,
+    caller-safe summary that is persisted on the lead and served by the API.
+    """
+
+    public_reason: str = "Enrichment failed"
 
 
 class ScrapeError(LeadEnrichmentError):
@@ -26,12 +34,19 @@ class ScrapeError(LeadEnrichmentError):
 
     Attributes:
         url: The URL that triggered the failure.
-        reason: Human-readable description of the failure mode.
+        reason: Diagnostic description of the failure mode, for logs only.
+        public_reason: Sanitised summary safe to store and return to API
+            callers.  Raw browser messages must never be passed here: they name
+            the exact internal address and error, which would turn the API into
+            a port-scanning oracle.
     """
 
-    def __init__(self, url: str, reason: str) -> None:
+    def __init__(
+        self, url: str, reason: str, *, public_reason: str = "Page could not be retrieved"
+    ) -> None:
         self.url = url
         self.reason = reason
+        self.public_reason = public_reason
         super().__init__(f"Scrape failed for '{url}': {reason}")
 
 
@@ -43,13 +58,19 @@ class LLMExtractionError(LeadEnrichmentError):
 
     Attributes:
         url:    The company URL that was being enriched when the error occurred.
-        reason: Human-readable description of the failure mode (API error,
-                schema validation failure, content-filter refusal, etc.).
+        reason: Diagnostic description of the failure mode (API error, schema
+                validation failure, content-filter refusal, etc.), for logs only.
+        public_reason: Sanitised summary safe to store and return to API
+                callers; provider error text can echo endpoints and key
+                fragments and must not reach it.
     """
 
-    def __init__(self, url: str, reason: str) -> None:
+    def __init__(
+        self, url: str, reason: str, *, public_reason: str = "LLM enrichment failed"
+    ) -> None:
         self.url = url
         self.reason = reason
+        self.public_reason = public_reason
         super().__init__(f"LLM extraction failed for '{url}': {reason}")
 
 

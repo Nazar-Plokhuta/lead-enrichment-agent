@@ -9,7 +9,7 @@ are never leaked in tracebacks or log output.
 from functools import lru_cache
 from typing import TYPE_CHECKING
 
-from pydantic import SecretStr
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 if TYPE_CHECKING:
@@ -38,8 +38,15 @@ class Settings(BaseSettings):
     ANTHROPIC_API_KEY: SecretStr | None = None
     OPENROUTER_API_KEY: SecretStr | None = None
     # Optional base URL override (self-hosted proxy or OpenAI-compatible
-    # endpoint), forwarded to litellm as ``api_base``.
+    # endpoint), forwarded to litellm as ``api_base``.  Applies to OpenAI
+    # models only, so it can never capture another provider's key.
     OPENAI_BASE_URL: str | None = None
+    # Per-attempt request timeout.  litellm's own default is 6000 s, long enough
+    # for one hung call to pin a concurrency slot (and its browser) for hours.
+    LLM_TIMEOUT_S: float = Field(default=45.0, gt=0)
+    # Retries on transient provider errors; worst case a call holds its slot for
+    # (LLM_MAX_RETRIES + 1) * LLM_TIMEOUT_S.
+    LLM_MAX_RETRIES: int = Field(default=2, ge=0, le=5)
 
     # --- Persistence ---
     DATABASE_PATH: str = "leads.db"

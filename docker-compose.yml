@@ -28,8 +28,12 @@ services:
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      LLM_TIMEOUT_S: ${LLM_TIMEOUT_S:-45}
+      LLM_MAX_RETRIES: ${LLM_MAX_RETRIES:-2}
+    # Loopback only: the API has no authentication, so it must not be reachable
+    # from the LAN.  n8n reaches it over the Compose network as http://app:8000.
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     # PID 1 reaps the zombie processes Chromium leaves behind.
     init: true
     # Docker's 64 MB default /dev/shm crashes Chromium on heavier pages.

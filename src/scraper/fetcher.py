@@ -25,6 +25,11 @@ as `ScrapeError` — the single error type callers outside this package need to
 handle.  Using a domain exception keeps the orchestration layer decoupled from
 the Playwright API surface.
 
+Playwright's own messages name the exact address and network error
+(``net::ERR_CONNECTION_REFUSED at http://10.0.0.5:8080``), which would let an
+API caller map the internal network.  They therefore go only into
+``ScrapeError.reason`` (logs); ``public_reason`` is one of a few fixed strings.
+
 Wait strategy
 -------------
 `domcontentloaded` is intentionally preferred over `networkidle` because
@@ -46,6 +51,9 @@ from src.scraper.browser import BrowserManager
 from src.scraper.cleaner import extract_markdown
 
 logger = logging.getLogger(__name__)
+
+# Chromium's error for a request our route handler aborted as "blockedbyclient".
+_BLOCKED_BY_POLICY_MARKER = "ERR_BLOCKED_BY_CLIENT"
 
 
 async def fetch_page_markdown(url: str, timeout_ms: int = 20_000) -> str:
@@ -70,8 +78,8 @@ async def fetch_page_markdown(url: str, timeout_ms: int = 20_000) -> str:
     """
     logger.info("Fetching page: %s (timeout=%dms)", url, timeout_ms)
 
-    async with BrowserManager() as context:
-        page = await context.new_page()
+    async with BrowserManager() as browser:
+        page = await browser.new_page()
 
         try:
             await page.goto(
@@ -81,17 +89,34 @@ async def fetch_page_markdown(url: str, timeout_ms: int = 20_000) -> str:
             )
         except PlaywrightTimeoutError as exc:
             logger.warning("Timeout after %dms navigating to %s", timeout_ms, url)
-            raise ScrapeError(url=url, reason=f"Navigation timed out after {timeout_ms}ms") from exc
+            raise ScrapeError(
+                url=url,
+                reason=f"Navigation timed out after {timeout_ms}ms",
+                public_reason=f"Navigation timed out after {timeout_ms}ms",
+            ) from exc
         except PlaywrightError as exc:
             logger.warning("Playwright navigation error for %s: %s", url, exc.message)
-            raise ScrapeError(url=url, reason=exc.message) from exc
+            blocked = _BLOCKED_BY_POLICY_MARKER in exc.message
+            raise ScrapeError(
+                url=url,
+                reason=exc.message,
+                public_reason=(
+                    "URL blocked: destination is not a public address"
+                    if blocked
+                    else "Page could not be loaded"
+                ),
+            ) from exc
 
         try:
             html: str = await page.content()
         except PlaywrightError as exc:
             # `page.content()` can fail if the renderer crashed after navigation.
             logger.warning("Failed to retrieve DOM content for %s: %s", url, exc.message)
-            raise ScrapeError(url=url, reason=f"DOM content retrieval failed: {exc.message}") from exc
+            raise ScrapeError(
+                url=url,
+                reason=f"DOM content retrieval failed: {exc.message}",
+                public_reason="Page content could not be read",
+            ) from exc
         finally:
             # Close the page explicitly before the context exits so that any
             # lingering resource handles are freed immediately.
