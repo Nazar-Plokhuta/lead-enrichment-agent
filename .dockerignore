@@ -9,3 +9,4 @@ tests/
 *.db
 docs/
 automation/
+frontend/
