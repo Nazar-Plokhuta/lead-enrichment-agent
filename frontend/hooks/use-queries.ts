@@ -2,6 +2,7 @@
 
 import {
   keepPreviousData,
+  type QueryClient,
   useMutation,
   useQuery,
   useQueryClient,
@@ -17,7 +18,13 @@ import {
   queryKeys,
   submitEnrich,
 } from "@/lib/api"
-import type { EnrichRequest, FitTier, LeadStatus } from "@/lib/types"
+import type {
+  EnrichRequest,
+  FitTier,
+  LeadListResponse,
+  LeadResponse,
+  LeadStatus,
+} from "@/lib/types"
 
 export const HEALTH_POLL_MS = 15_000
 export const ACTIVITY_POLL_ACTIVE_MS = 3_000
@@ -81,6 +88,51 @@ export function useLead(id: number | null) {
   })
 }
 
+export const INSPECTOR_POLL_MS = 3_000
+
+/**
+ * Freshest copy of a lead from any cached list (table pages or the activity
+ * query), so the inspector can paint instantly instead of showing a skeleton.
+ */
+function findCachedLead(
+  queryClient: QueryClient,
+  id: number,
+): { lead: LeadResponse; updatedAt: number } | undefined {
+  let best: { lead: LeadResponse; updatedAt: number } | undefined
+  for (const key of [queryKeys.leadLists, queryKeys.pending]) {
+    for (const query of queryClient.getQueryCache().findAll({ queryKey: key })) {
+      const lead = (query.state.data as LeadListResponse | undefined)?.items.find(
+        (item) => item.id === id,
+      )
+      if (lead && (!best || query.state.dataUpdatedAt > best.updatedAt)) {
+        best = { lead, updatedAt: query.state.dataUpdatedAt }
+      }
+    }
+  }
+  return best
+}
+
+/**
+ * Inspector detail query: seeded from the list cache, then always revalidated
+ * (`staleTime: 0`) against `GET /leads/{id}`. Polls only while PENDING, since
+ * the table list itself is deliberately not polled.
+ */
+export function useLeadInspector(id: number | null) {
+  const queryClient = useQueryClient()
+  return useQuery({
+    queryKey: queryKeys.lead(id ?? -1),
+    queryFn: () => fetchLead(id as number),
+    enabled: id !== null,
+    staleTime: 0,
+    initialData: () =>
+      id === null ? undefined : findCachedLead(queryClient, id)?.lead,
+    initialDataUpdatedAt: () =>
+      id === null ? undefined : findCachedLead(queryClient, id)?.updatedAt,
+    refetchInterval: (query) =>
+      query.state.data?.status === "PENDING" ? INSPECTOR_POLL_MS : false,
+  })
+}
+
 export function useEnrichMutation() {
   const queryClient = useQueryClient()
   return useMutation({
@@ -90,6 +142,7 @@ export function useEnrichMutation() {
       Promise.all([
         queryClient.invalidateQueries({ queryKey: queryKeys.leadLists }),
         queryClient.invalidateQueries({ queryKey: queryKeys.pending }),
+        queryClient.invalidateQueries({ queryKey: queryKeys.leadDetails }),
       ]),
   })
 }

@@ -131,5 +131,7 @@ export const queryKeys = {
   leadList: (params: { page: number; status: LeadStatus | null; tier: FitTier | null }) =>
     ["leads", "list", params] as const,
   pending: ["leads", "pending"] as const,
+  /** Prefix of every single-lead query, for bulk invalidation. */
+  leadDetails: ["leads", "detail"] as const,
   lead: (id: number) => ["leads", "detail", id] as const,
 }

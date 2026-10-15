@@ -129,3 +129,13 @@
     @apply font-sans;
   }
 }
+
+/* Indeterminate progress hairline for in-flight re-runs (see lead inspector). */
+@keyframes hairline {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(250%);
+  }
+}

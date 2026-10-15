@@ -15,6 +15,18 @@ export function isShortcutBlocked(event: KeyboardEvent): boolean {
   return target.isContentEditable || target.closest(TEXT_ENTRY_OR_OVERLAY) !== null
 }
 
+/**
+ * Like `isShortcutBlocked`, but lets keys through from inside dialogs. The
+ * inspector's `[` / `]` must keep working while it is a modal Sheet, where
+ * focus always sits inside `[role='dialog']`.
+ */
+export function isTypingTarget(event: KeyboardEvent): boolean {
+  if (event.defaultPrevented || event.metaKey || event.ctrlKey || event.altKey) return true
+  const target = event.target
+  if (!(target instanceof HTMLElement)) return false
+  return target.isContentEditable || target.closest("input, textarea, select") !== null
+}
+
 /** `Enter` on a focused button/link activates it natively; don't also hijack it. */
 export function isNativelyActivatable(event: KeyboardEvent): boolean {
   return event.target instanceof HTMLElement && event.target.closest(NATIVELY_ACTIVATABLE) !== null

@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from "react"
 
 import { ActionBar } from "@/components/action-bar"
 import { Header } from "@/components/header"
+import { InspectorPane } from "@/components/inspector-pane"
 import { LeadTable } from "@/components/lead-table"
 import { ShortcutsDialog } from "@/components/shortcuts-dialog"
 import { useConsoleParams } from "@/hooks/use-console-params"
@@ -36,15 +37,20 @@ export function Console() {
   return (
     <div className="flex min-h-screen flex-col">
       <Header onShowShortcuts={() => setShortcutsOpen(true)} />
-      <ActionBar value={draft} onValueChange={setDraft} inputRef={inputRef} />
-      <main className="flex flex-1 flex-col">
-        <LeadTable
-          onPickPreset={(url) => {
-            setDraft(url)
-            inputRef.current?.focus()
-          }}
-        />
-      </main>
+      <div className="flex flex-1">
+        <div className="flex min-w-0 flex-1 flex-col">
+          <ActionBar value={draft} onValueChange={setDraft} inputRef={inputRef} />
+          <main className="flex flex-1 flex-col">
+            <LeadTable
+              onPickPreset={(url) => {
+                setDraft(url)
+                inputRef.current?.focus()
+              }}
+            />
+          </main>
+        </div>
+        <InspectorPane />
+      </div>
       <ShortcutsDialog open={shortcutsOpen} onOpenChange={setShortcutsOpen} />
     </div>
   )

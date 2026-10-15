@@ -236,6 +236,21 @@ export function LeadTable({ onPickPreset }: { onPickPreset: (url: string) => voi
   const [cursorId, setCursorId] = useState<number | null>(null)
   const bodyRef = useRef<HTMLTableSectionElement>(null)
 
+  // The inspector can move `?lead=` (`[` / `]`, deep links); keep the cursor on
+  // it so `j`/`k` continue from the open row. Adjusted during render rather
+  // than in an effect to avoid a frame with a stale cursor.
+  const [syncedLead, setSyncedLead] = useState<number | null>(null)
+  if (params.lead !== syncedLead) {
+    setSyncedLead(params.lead)
+    if (params.lead !== null) setCursorId(params.lead)
+  }
+  useEffect(() => {
+    if (params.lead === null) return
+    bodyRef.current
+      ?.querySelector(`[data-lead-id="${params.lead}"]`)
+      ?.scrollIntoView({ block: "nearest" })
+  }, [params.lead])
+
   useEffect(() => {
     function onKeyDown(event: KeyboardEvent) {
       if (isShortcutBlocked(event)) return

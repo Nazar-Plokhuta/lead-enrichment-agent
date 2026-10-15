@@ -13,6 +13,8 @@ const SHORTCUTS: readonly { keys: readonly string[]; action: string }[] = [
   { keys: ["j"], action: "Move selection down" },
   { keys: ["k"], action: "Move selection up" },
   { keys: ["Enter"], action: "Open the selected lead" },
+  { keys: ["["], action: "Previous lead (inspector open)" },
+  { keys: ["]"], action: "Next lead (inspector open)" },
   { keys: ["Esc"], action: "Blur input / close inspector" },
   { keys: ["?"], action: "Show this help" },
 ]
