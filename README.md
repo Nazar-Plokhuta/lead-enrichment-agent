@@ -153,13 +153,14 @@ lead-enrichment-agent/
 │   ├── fixtures/eval/         # Golden Markdown pages for offline rubric regression
 │   ├── conftest.py            # Autouse guard: no sockets, no DNS
 │   └── test_*.py              # api, browser, llm_client, scoring_regression, ...
+├── frontend/                  # Next.js operator console (Route Handler proxy, Dockerfile)
 ├── automation/n8n/            # Importable n8n workflow that drives the API
 ├── docs/internal/
 │   ├── architecture.md        # System design, contracts, security topology
 │   └── state.md               # Implementation state & decision log (D-01 … D-12)
-├── .github/workflows/ci.yml   # uv sync, ruff check, pytest
+├── .github/workflows/ci.yml   # backend (ruff, pytest) and frontend (tsc, lint, vitest, build) jobs
 ├── Dockerfile                 # Multi-stage uv build, non-root runtime
-├── docker-compose.yml         # app + PostgreSQL + n8n
+├── docker-compose.yml         # app + PostgreSQL + frontend + n8n
 ├── pyproject.toml             # Dependencies and uv settings
 ├── uv.lock                    # Locked dependency set
 ├── .env.example               # Environment variable reference
@@ -329,6 +330,32 @@ Status values are `PENDING`, `PROCESSED` and `FAILED`.  A `FAILED` lead carries 
 
 ---
 
+## Operator Console (Web UI)
+
+A Next.js (App Router, TypeScript, Tailwind, shadcn/ui) operator console in [`frontend/`](frontend/) sits on top of the REST API: submit URLs, watch `PENDING` leads resolve, filter by fit tier and inspect the score rubric.  The browser only talks to the Next.js origin; a Route Handler (`frontend/app/api/[...path]/route.ts`) forwards an explicit allowlist of paths to FastAPI, so the backend needs no CORS configuration and returns `502 Bad Gateway` to the UI when it is down.
+
+```
+ Browser ──HTTP──▶ Next.js :3000 ──────────▶ FastAPI :8000 ──▶ SQLite / PostgreSQL
+ (console)         app/api/[...path]         (src/api/)
+                   allowlisted proxy         API_ORIGIN
+                   /health  /openapi.json
+                   /api/v1/enrich
+                   /api/v1/leads[/{id}]
+```
+
+**Local development** (API on `127.0.0.1:8000`, see [Run it](#3-run-it)):
+
+```bash
+uv run uvicorn src.api.app:app --host 127.0.0.1 --port 8000   # terminal 1
+cd frontend && pnpm install && pnpm dev                        # terminal 2
+```
+
+Open <http://127.0.0.1:3000>.  The proxy targets `http://127.0.0.1:8000` unless `API_ORIGIN` is set.  Frontend checks: `pnpm tsc --noEmit`, `pnpm lint`, `pnpm test`, `pnpm build`.
+
+**Docker Compose**: `docker compose up -d --build` also starts the console at <http://127.0.0.1:3000>, wired to the API as `API_ORIGIN=http://app:8000` once `app` is healthy.  Like the API, it is bound to loopback only and has no authentication of its own.
+
+---
+
 ## Docker Compose & n8n
 
 ```bash
@@ -340,6 +367,7 @@ docker compose up -d --build
 |---|---|---|
 | `app` | `127.0.0.1:8000` | FastAPI + Playwright, non-root user, `init: true`, `shm_size: 1gb`, healthcheck on `/health`. |
 | `postgres` | `127.0.0.1:5432` | `postgres:16-alpine`, data in the `postgres_data` volume; `app` starts only once it is healthy. |
+| `frontend` | `127.0.0.1:3000` | Next.js operator console (standalone build, non-root uid 1000); starts after `app` is healthy and proxies to it as `http://app:8000`. |
 | `n8n` | `127.0.0.1:5678` | Self-hosted automation; starts after `app` is healthy and reaches it as `http://app:8000`. |
 
 The image is a multi-stage `uv` build: dependencies come from `uv.lock` (`uv sync --frozen`), and Chromium is installed from that same locked Playwright package so the browser revision always matches.  The `app` service is wired to PostgreSQL through `DATABASE_URL`.

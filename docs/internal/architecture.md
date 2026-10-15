@@ -69,6 +69,8 @@ flowchart TB
     BASE -->|"DATABASE_URL set"| PG
 ```
 
+The Next.js operator console (`frontend/`) is a third client of the REST API; it reaches FastAPI only through its allowlisted Route Handler proxy (see [section 9](#9-deployment-topology)) and adds no backend behaviour.
+
 **Pipeline** (one lead):
 
 1. **Input**: a company URL, from the CLI arguments or `POST /api/v1/enrich`.
@@ -382,8 +384,10 @@ These are the rules in `CLAUDE.md`, with the v2.0 additions marked.
 
 ```mermaid
 flowchart LR
+    BROWSER["Operator browser"]
     subgraph Host ["Docker host (ports bound to 127.0.0.1)"]
         subgraph Compose ["docker compose network"]
+            FE["frontend<br/>Next.js standalone<br/>:3000, non-root uid 1000<br/>Route Handler reverse proxy"]
             N8N["n8n<br/>:5678<br/>workflow automation"]
             APP["app<br/>FastAPI + Playwright<br/>:8000, non-root uid 1000"]
             PGS[("postgres:16-alpine<br/>:5432")]
@@ -393,6 +397,9 @@ flowchart LR
     LLMP["LLM provider API"]
     WEB["Public target sites"]
 
+    BROWSER -->|"127.0.0.1:3000"| FE
+    FE -->|"API_ORIGIN=http://app:8000<br/>allowlisted paths only"| APP
+    GW -.->|"required for any non-loopback exposure"| FE
     GW -.->|"required for any non-loopback exposure"| APP
     N8N -->|"http://app:8000"| APP
     APP -->|"DATABASE_URL"| PGS
@@ -400,12 +407,15 @@ flowchart LR
     APP -->|"Chromium, SSRF-guarded"| WEB
 ```
 
+The browser never talks to FastAPI.  `frontend/app/api/[...path]/route.ts` is a server-side reverse proxy that forwards only `/health`, `/openapi.json`, `/api/v1/enrich`, `/api/v1/leads` and `/api/v1/leads/{id}` to `API_ORIGIN` (read at request time, so the same image works against any backend) and answers `502 Bad Gateway` when the upstream fails.  Because the proxy is same-origin, FastAPI is deliberately not configured with CORS.
+
 - **Image** (`Dockerfile`): multi-stage.  The builder runs `uv sync --frozen --no-dev` against copied manifests; the runtime stage copies the venv, runs `playwright install --with-deps chromium` from that venv (so the browser revision matches the locked Playwright package), copies `src/`, and drops to a non-root user (uid 1000).  `CMD` is `uv run uvicorn src.api.app:app --host 0.0.0.0 --port 8000`; `UV_FROZEN` and `UV_NO_SYNC` keep `uv run` from re-resolving at start.
-- **Compose** (`docker-compose.yml`): `postgres` with a `pg_isready` healthcheck; `app` waits for it (`service_healthy`) and sets `DATABASE_URL`, `LLM_MODEL`, the three provider keys, `LLM_TIMEOUT_S` and `LLM_MAX_RETRIES`; `n8n` waits for the `app` healthcheck.  `init: true` reaps zombie Chromium processes, and `shm_size: 1gb` avoids Chromium crashes on the 64 MB default.
+- **Frontend image** (`frontend/Dockerfile`): three stages on `node:22-alpine`.  `deps` runs `corepack enable && pnpm install --frozen-lockfile` against the copied manifests; `builder` runs `pnpm build` with `output: "standalone"`; `runner` copies only `.next/standalone`, `.next/static` and `public/`, sets `HOSTNAME=0.0.0.0`, and drops to the `node` user (uid 1000).  `frontend/.dockerignore` keeps `node_modules`, `.next` and env files out of the build context.
+- **Compose** (`docker-compose.yml`): `postgres` with a `pg_isready` healthcheck; `app` waits for it (`service_healthy`) and sets `DATABASE_URL`, `LLM_MODEL`, the three provider keys, `LLM_TIMEOUT_S` and `LLM_MAX_RETRIES`; `frontend` and `n8n` wait for the `app` healthcheck, and `frontend` sets `API_ORIGIN=http://app:8000`.  `init: true` reaps zombie Chromium processes, and `shm_size: 1gb` avoids Chromium crashes on the 64 MB default.
 - **Health**: `GET /health` returns `503` when the database is unreachable, which fails the container healthcheck.
-- **Exposure**: all three published ports bind to `127.0.0.1`.  The API is unauthenticated, so any wider exposure requires an upstream gateway or reverse proxy that provides access control and TLS.
+- **Exposure**: all four published ports bind to `127.0.0.1`.  Neither the API nor the console is authenticated, so any wider exposure requires an upstream gateway or reverse proxy that provides access control and TLS.
 - **Not pinned**: the `uv` image and `n8n` image use `latest`; the Python dependencies are pinned by `uv.lock`.
-- **CI** (`.github/workflows/ci.yml`): `uv sync --dev`, `uv run playwright install chromium`, `uv run ruff check src/`, `uv run pytest tests/ -v` with a mock `OPENAI_API_KEY`, `LLM_MODEL=gpt-4o-mini` and `DATABASE_PATH=:memory:`.
+- **CI** (`.github/workflows/ci.yml`): two parallel jobs.  `lint-and-test`: `uv sync --dev`, `uv run playwright install chromium`, `uv run ruff check src/`, `uv run pytest tests/ -v` with a mock `OPENAI_API_KEY`, `LLM_MODEL=gpt-4o-mini` and `DATABASE_PATH=:memory:`.  `frontend` (Node 22, pnpm from `packageManager`): `pnpm install --frozen-lockfile`, `pnpm tsc --noEmit`, `pnpm lint`, `pnpm test`, `pnpm build`.
 
 ---
 

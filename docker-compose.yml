@@ -49,6 +49,20 @@ services:
       retries: 3
       start_period: 20s
 
+  frontend:
+    build:
+      context: ./frontend
+    depends_on:
+      app:
+        condition: service_healthy
+    environment:
+      # Server-side only: the Route Handler proxies to the API over the Compose network,
+      # so the browser never reaches the unauthenticated backend directly.
+      API_ORIGIN: http://app:8000
+    # Loopback only: the console has no authentication of its own.
+    ports:
+      - "127.0.0.1:3000:3000"
+
   n8n:
     image: docker.n8n.io/n8nio/n8n:latest
     restart: unless-stopped
